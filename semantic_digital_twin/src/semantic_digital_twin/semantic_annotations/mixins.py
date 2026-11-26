@@ -35,6 +35,7 @@ from random_events.set import Set as EventSet
 from random_events.variable import Symbolic
 
 from semantic_digital_twin.specifications.connections import (
+    Connection6DoFSpecification,
     ScrewAxisConnectionSpecification,
     ConnectionSpecification,
 )
@@ -55,6 +56,7 @@ from semantic_digital_twin.exceptions import (
     MissingMovableJointError,
     NoGraspGeometry,
     NoSupportingSurfaceError,
+    NotAPartOf,
     UnknownPartWholeRelationshipField,
 )
 from semantic_digital_twin.grasping.grasp_candidates import GraspCandidate
@@ -101,6 +103,7 @@ from semantic_digital_twin.world_description.world_modification import (
 )
 
 if TYPE_CHECKING:
+    from krrood.class_diagrams.wrapped_field import WrappedField
     from semantic_digital_twin.grasping.object_relative_grasp import GraspResult
     from semantic_digital_twin.world import World
     from semantic_digital_twin.semantic_annotations.semantic_annotations import (
@@ -109,6 +112,7 @@ if TYPE_CHECKING:
         Handle,
         Rim,
         Aperture,
+        BottleCap,
         Leg,
         Sink,
         ShelfLayer,
@@ -630,7 +634,17 @@ class PartWholeRelationship(HasRootKinematicStructureEntity, Mixin):
     Each part mixin (``HasHandle``, ``HasDoors``, ...) declares a typed part-whole relationship
     field. The unified :meth:`add` routes a part to the field whose element type matches it and lets
     the part mount itself (:meth:`HasRootKinematicStructureEntity._mount_strategy`).
+    :meth:`remove` gives a part up again and hangs it free from the world root.
     """
+
+    @classproperty
+    def part_whole_relationship_fields(cls) -> list[WrappedField]:
+        """
+        :return: The fields of this annotation type that hold its structural parts.
+        """
+        return WrappedClass(clazz=cls).fields_with_metadata(
+            metadata_type=IsPartWholeRelationship
+        )
 
     @synchronized_attribute_modification
     def add(
@@ -652,9 +666,7 @@ class PartWholeRelationship(HasRootKinematicStructureEntity, Mixin):
         :raises AmbiguousPart: If ``type(part)`` matches more than one part-whole
             relationship field.
         """
-        candidate_fields = WrappedClass(clazz=type(self)).fields_with_metadata(
-            metadata_type=IsPartWholeRelationship
-        )
+        candidate_fields = self.part_whole_relationship_fields
         if field_name:
             named_fields = [
                 wrapped_part_whole_relationship_field
@@ -690,6 +702,31 @@ class PartWholeRelationship(HasRootKinematicStructureEntity, Mixin):
         else:
             setattr(self, match.field.name, part)
 
+    @synchronized_attribute_modification
+    def remove(self, *, part: HasRootKinematicStructureEntity) -> None:
+        """
+        Remove ``part`` from the structural parts of this annotation and hang it from
+        the world root on a free joint, keeping its pose in the world.
+
+        :param part: The part to remove.
+        :raises NotAPartOf: If ``part`` is not one of :attr:`parts`.
+        """
+        if part not in self.parts:
+            raise NotAPartOf(whole=self, part=part)
+        for (
+            wrapped_part_whole_relationship_field
+        ) in self.part_whole_relationship_fields:
+            field_name = wrapped_part_whole_relationship_field.field.name
+            value = getattr(self, field_name)
+            if wrapped_part_whole_relationship_field.is_many_to_many_relationship:
+                setattr(self, field_name, [item for item in value if item != part])
+            elif value == part:
+                setattr(self, field_name, None)
+        self._world.move_branch(
+            part.root, self._world.root, enable_unsafe_inside_world_block=True
+        )
+        Connection6DoFSpecification().reconnect(world=self._world, child=part.root)
+
     @property
     def parts(self) -> list[HasRootKinematicStructureEntity]:
         """
@@ -697,9 +734,9 @@ class PartWholeRelationship(HasRootKinematicStructureEntity, Mixin):
             relationship fields.
         """
         parts = []
-        for wrapped_part_whole_relationship_field in WrappedClass(
-            clazz=type(self)
-        ).fields_with_metadata(metadata_type=IsPartWholeRelationship):
+        for (
+            wrapped_part_whole_relationship_field
+        ) in self.part_whole_relationship_fields:
             value = getattr(self, wrapped_part_whole_relationship_field.field.name)
             if wrapped_part_whole_relationship_field.is_many_to_many_relationship:
                 parts.extend(value)
@@ -873,6 +910,21 @@ class HasHandle(IsGraspable, PartWholeRelationship, Mixin):
         if self.handle is None:
             return super().grasped_part()
         return self.handle
+
+
+@dataclass(eq=False, kw_only=True)
+class HasBottleCap(PartWholeRelationship, Mixin):
+    """
+    A mixin class for semantic annotations that a bottle cap closes.
+    """
+
+    bottle_cap: BottleCap | None = field(
+        default=None,
+        metadata=IsPartWholeRelationship().as_dict(),
+    )
+    """
+    The cap closing the semantic annotation, or ``None`` while it has no cap.
+    """
 
 
 @dataclass(eq=False)

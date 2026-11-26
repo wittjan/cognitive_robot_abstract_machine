@@ -40,6 +40,7 @@ from semantic_digital_twin.semantic_annotations.mixins import (
     HasRootRegion,
     HasDrawers,
     HasDoors,
+    HasBottleCap,
     HasHandle,
     HasHandles,
     HasCaseAsRootBody,
@@ -964,7 +965,7 @@ class Tableware(IsGraspable):
 
 
 @dataclass(eq=False)
-class Bottle(Container):
+class Bottle(Container, HasBottleCap):
     """
     Abstract class for bottles.
     """

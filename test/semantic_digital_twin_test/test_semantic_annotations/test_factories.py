@@ -1550,6 +1550,52 @@ def test_remove_takes_off_the_part_an_equal_annotation_stands_for() -> None:
     assert bottle.bottle_cap is None
 
 
+def test_remove_remembers_every_removed_part() -> None:
+    """
+    A whole lists every part removed from it, in the order they came off.
+    """
+    world = _world_with_root()
+    with world.modify_world():
+        fridge = Fridge.create_with_new_body_in_world(
+            name="fridge", world=world, scale=Scale(1, 1, 2.0)
+        )
+        first_drawer = Drawer.create_with_new_body_in_world(
+            name="first_drawer", world=world
+        )
+        second_drawer = Drawer.create_with_new_body_in_world(
+            name="second_drawer", world=world
+        )
+        fridge.add(first_drawer)
+        fridge.add(second_drawer)
+
+    with world.modify_world():
+        fridge.remove(part=first_drawer)
+        fridge.remove(part=second_drawer)
+
+    assert fridge.removed_parts == [first_drawer, second_drawer]
+
+
+def test_add_takes_part_back_out_of_removed_parts() -> None:
+    """
+    Putting a removed cap back onto its bottle takes it out of the bottle's removed
+    parts.
+    """
+    world = _world_with_root()
+    with world.modify_world():
+        bottle = Bottle.create_with_new_body_in_world(
+            name="bottle", world=world, scale=Scale(0.08, 0.08, 0.25)
+        )
+        cap = BottleCap.create_with_new_body_in_world(name="bottle_cap", world=world)
+        bottle.add(cap)
+    with world.modify_world():
+        bottle.remove(part=cap)
+
+    with world.modify_world():
+        bottle.add(cap)
+
+    assert bottle.removed_parts == []
+
+
 # %% movable joints
 # A part that moves relative to its whole says where its joint sits, so it can be mounted
 # on one, and refuses to be moved while nothing moves it.

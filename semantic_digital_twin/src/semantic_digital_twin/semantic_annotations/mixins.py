@@ -637,6 +637,14 @@ class PartWholeRelationship(HasRootKinematicStructureEntity, Mixin):
     :meth:`remove` gives a part up again and hangs it free from the world root.
     """
 
+    removed_parts: list[HasRootKinematicStructureEntity] = field(
+        default_factory=list, hash=False, kw_only=True
+    )
+    """
+    The annotations removed from this one as parts that have not been added back, in
+    the order they were removed.
+    """
+
     @classproperty
     def part_whole_relationship_fields(cls) -> list[WrappedField]:
         """
@@ -652,7 +660,7 @@ class PartWholeRelationship(HasRootKinematicStructureEntity, Mixin):
     ) -> None:
         """
         Add ``part`` as a structural part, routing it to the matching part-whole
-        relationship field by type.
+        relationship field by type, and take it out of :attr:`removed_parts`.
 
         :param part: The part to add.
         :param field_name: Optional name of the target part-whole relationship field.
@@ -701,6 +709,8 @@ class PartWholeRelationship(HasRootKinematicStructureEntity, Mixin):
             getattr(self, match.field.name).append(part)
         else:
             setattr(self, match.field.name, part)
+        if part in self.removed_parts:
+            self.removed_parts.remove(part)
 
     @synchronized_attribute_modification
     def remove(self, *, part: HasRootKinematicStructureEntity) -> None:
@@ -722,6 +732,7 @@ class PartWholeRelationship(HasRootKinematicStructureEntity, Mixin):
                 setattr(self, field_name, [item for item in value if item != part])
             elif value == part:
                 setattr(self, field_name, None)
+        self.removed_parts.append(part)
         self._world.move_branch(
             part.root, self._world.root, enable_unsafe_inside_world_block=True
         )

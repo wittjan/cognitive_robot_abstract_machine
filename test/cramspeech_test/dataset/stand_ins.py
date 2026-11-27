@@ -23,34 +23,6 @@ from typing_extensions import Any, Callable, Iterator, Self
 
 # %% Microphone driver
 @dataclass(kw_only=True)
-class SilentInputDevice:
-    """
-    Takes the place of :func:`sounddevice.rec` and :func:`sounddevice.wait`: every
-    recording is silence of the requested shape, and every request is kept for
-    inspection.
-    """
-
-    requests: list[dict[str, Any]] = field(default_factory=list)
-    """
-    The keyword arguments of each :meth:`rec` call, in call order.
-    """
-
-    def rec(self, **arguments: Any) -> np.ndarray:
-        """
-        :return: Zeros with one row per requested frame and one column per channel.
-        """
-        self.requests.append(arguments)
-        return np.zeros(
-            (arguments["frames"], arguments["channels"]), dtype=arguments["dtype"]
-        )
-
-    def wait(self) -> None:
-        """
-        Returns at once, since :meth:`rec` finishes its recording immediately.
-        """
-
-
-@dataclass(kw_only=True)
 class ReplayingInputDevice:
     """
     Takes the place of :class:`sounddevice.InputStream`: as soon as the stream opens,
@@ -201,6 +173,38 @@ class LiveInputDevice(ReplayingInputDevice):
         self.closed.set()
         self.delivery.join()
         self.is_open = False
+
+
+@dataclass(kw_only=True)
+class SteppedInputDevice(ReplayingInputDevice):
+    """
+    Takes the place of :class:`sounddevice.InputStream` like a microphone whose blocks
+    arrive when the test says so: opening the stream delivers the first block of the
+    recording, and each :meth:`deliver_next_block` the one after.
+    """
+
+    delivered_block_count: int = 0
+    """
+    Number of blocks of the recording handed to the callback so far.
+    """
+
+    def __enter__(self) -> Self:
+        """
+        Opens the stream and delivers only the first block.
+        """
+        self.is_open = True
+        self.deliver_next_block()
+        return self
+
+    def deliver_next_block(self) -> None:
+        """
+        Hand the next block of the recording to the latest stream's callback.
+        """
+        block = self.recorded_blocks()[self.delivered_block_count]
+        self.delivered_block_count += 1
+        self.callback(
+            block[:, np.newaxis], len(block), None, sounddevice.CallbackFlags()
+        )
 
 
 @dataclass(kw_only=True)

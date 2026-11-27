@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-from cramspeech.testing import PiperCommandLine, Speaker, VoiceConfiguration
+from cramspeech.piper_speaker import PiperCommandLine, Speaker, VoiceConfiguration
 
 from .dataset.dataset_files import PiperVoiceFile
 from .dataset.stand_ins import LoudspeakerKeepingWhatItPlays, PiperProgram

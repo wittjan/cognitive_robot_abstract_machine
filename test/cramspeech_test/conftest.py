@@ -26,23 +26,11 @@ from .dataset.stand_ins import (
     ModelReturningSegments,
     PiperProgram,
     ReplayingInputDevice,
-    SilentInputDevice,
+    SteppedInputDevice,
 )
 
 
 # %% Microphone driver
-@pytest.fixture
-def silent_input_device(monkeypatch: pytest.MonkeyPatch) -> SilentInputDevice:
-    """
-    Replaces the recording calls of :mod:`sounddevice` with silence for the duration of
-    a test.
-    """
-    device = SilentInputDevice()
-    monkeypatch.setattr(sounddevice, "rec", device.rec)
-    monkeypatch.setattr(sounddevice, "wait", device.wait)
-    return device
-
-
 @pytest.fixture
 def replay_through_the_microphone(
     monkeypatch: pytest.MonkeyPatch,
@@ -83,6 +71,27 @@ def stream_through_the_microphone(
         return device
 
     return stream
+
+
+@pytest.fixture
+def step_through_the_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[Recording], SteppedInputDevice]:
+    """
+    Makes every :class:`sounddevice.InputStream` opened during a test play the given
+    recording one block at a time, each when the test delivers it.
+    """
+
+    def step(recording: Recording) -> SteppedInputDevice:
+        """
+        :param recording: The audio the microphone delivers, block by block.
+        :return: The device that plays it, for delivering its blocks.
+        """
+        device = SteppedInputDevice(recording=recording)
+        monkeypatch.setattr(sounddevice, "InputStream", device.input_stream)
+        return device
+
+    return step
 
 
 @pytest.fixture
@@ -226,16 +235,18 @@ def recognizer_hearing_every_sound(
 @pytest.fixture
 def stop_in_time() -> Callable[[BackgroundListener], bool]:
     """
-    Stops background listeners from another thread, so that a listener that never stops
-    fails a test instead of hanging it.
+    Leaves the ``with`` statement of background listeners from another thread, so that a
+    listener that never stops fails a test instead of hanging it.
     """
 
     def stop(listener: BackgroundListener) -> bool:
         """
-        :param listener: The started listener to stop.
-        :return: Whether :meth:`BackgroundListener.stop` returned within five seconds.
+        :param listener: The listening listener to stop.
+        :return: Whether leaving its ``with`` statement finished within five seconds.
         """
-        stopping = Thread(target=listener.stop, daemon=True)
+        stopping = Thread(
+            target=listener.__exit__, args=(None, None, None), daemon=True
+        )
         stopping.start()
         stopping.join(timeout=5.0)
         return not stopping.is_alive()
@@ -249,10 +260,10 @@ def background_listener(
     stop_in_time: Callable[[BackgroundListener], bool],
 ) -> Iterator[BackgroundListener]:
     """
-    A listener on :func:`recognizer_hearing_every_sound`, stopped after the test, which
-    fails when it does not stop.
+    A listener on :func:`recognizer_hearing_every_sound`, stopped after the test if it
+    still listens, which fails when it does not stop.
     """
     listener = BackgroundListener(recognizer=recognizer_hearing_every_sound)
     yield listener
-    if not stop_in_time(listener):
+    if listener.listening is not None and not stop_in_time(listener):
         pytest.fail("The background listener did not stop.")

@@ -63,8 +63,8 @@ started to its end.
 ## Listening in a demo
 
 A CRAM demo runs its plan with `run()`, which returns once the robot is done.
-`BackgroundListener` keeps listening meanwhile, in a thread of its own, and queues every sentence
-until the demo reads it. In `coraplex/demos/coraplex_hsr_mujoco_demo`, next to `demo.py`:
+`BackgroundListener` keeps listening meanwhile, in a thread of its own, while its `with`
+statement runs, and keeps every sentence until the demo takes it. In `coraplex/demos/coraplex_hsr_mujoco_demo`, next to `demo.py`:
 
 ```python
 from demo import MilkTransportDemonstration
@@ -75,31 +75,38 @@ from cramspeech.transcription import WhisperTranscriber
 recognizer = SpeechRecognizer(transcriber=WhisperTranscriber(hotwords=["milk", "table"]))
 print(recognizer.hear_next_utterance(timeout=30.0).text)   # "Bring the milk to the table."
 
-listener = BackgroundListener(recognizer=recognizer)
-listener.start()                                   # hears the operator while the robot works
-MilkTransportDemonstration().run()
-listener.stop()                                    # at the next block, also during silence
-while not listener.heard.empty():
-    print("Said during the transport:", listener.heard.get().text)
+with BackgroundListener(recognizer=recognizer) as listener:   # hears the operator meanwhile
+    MilkTransportDemonstration().run()
+    for transcript in listener.take_heard_sentences():          # also while the plan runs
+        print("Said during the transport:", transcript.text)
 ```
+
+Leaving the `with` statement stops listening at the next block, also during silence, and releases
+the microphone, also when the plan fails. When the microphone stops delivering audio, for
+example because it was unplugged, `take_heard_sentences` raises `MicrophoneStopped` once every
+sentence heard before was taken, and leaving the `with` statement raises it too. A listener
+that already listens refuses to be entered again with `AlreadyListening`.
 
 Without the thread, pass a `threading.Event` to `hear_utterances(stop_requested=event)` and set
 it from another thread. Listening ends at the next block, after a transcription under way.
 
 ## Not hearing the robot itself
 
-Wrap everything the robot says in `recognizer.pause()`. Audio that arrives meanwhile is dropped,
-together with an utterance that was under way when the pause began, also when the recognizer is
-still busy with an earlier utterance:
+Wrap everything the robot says in `recognizer.microphone.mute()`. Audio recorded meanwhile is
+dropped, together with the block of `block_duration` that was being recorded when the mute
+ended, and with an utterance that was under way when the mute began, also when the recognizer is
+still busy with an earlier utterance. Mutes may overlap, also from several threads; the
+microphone stays muted until the last one ends. A recording of `hear(duration=...)` that
+overlaps a mute is silence:
 
 ```python
-with recognizer.pause():
+with recognizer.microphone.mute():
     say_on_the_robot("I see a cup and two bottles.")
     wait_until_spoken()
 ```
 
 On the HSR the sentence goes to `/talk_request` as a `tmc_voice_msgs/msg/Voice`. The robot reports
-no end of speaking, so wait inside the pause until the sentence is over.
+no end of speaking, so wait inside the mute until the sentence is over.
 
 ## Changing the parameters of the pipeline
 
@@ -162,6 +169,19 @@ recognizer = SpeechRecognizer(
 | `compute_type` | `INT8` | `INT8` (CPU), `FLOAT16` (graphics card), `FLOAT32` (most accurate, slowest) | Whisper runs on a graphics card |
 | `hotwords` | none | words and phrases the speech is likely to hold | names or objects are heard as similar words |
 
+faster-whisper keeps only the first 223 [tokens](https://github.com/SYSTRAN/faster-whisper/blob/v1.2.1/faster_whisper/transcribe.py)
+of the hotwords (see `get_prompt`), half of Whisper's context of 448 tokens, and drops the rest
+without warning. With its comma an English word takes about 2 tokens and a German compound up to
+6, so about 90 English or 40 German hotwords fit. List the most important ones first, and keep to
+the words the current task expects: hotwords make Whisper prefer a word, they do not guarantee
+it. To count the tokens of a list:
+
+```python
+transcriber = WhisperTranscriber(hotwords=["Toya", "dishwasher tab"])
+hotwords = " " + ", ".join(transcriber.hotwords)
+print(len(transcriber.model.hf_tokenizer.encode(hotwords, add_special_tokens=False).ids))
+```
+
 Whisper runs on a graphics card by itself when faster-whisper finds one, and on the CPU otherwise.
 
 ### Listening (`SpeechRecognizer`)
@@ -208,7 +228,7 @@ for plan in instruction_plans.plans:               # one plan per task of the in
 
 ## Testing on a laptop
 
-`cramspeech.testing.Speaker` says sentences on the laptop with a [Piper](https://github.com/OHF-Voice/piper1-gpl)
+`cramspeech.piper_speaker.Speaker` says sentences on the laptop with a [Piper](https://github.com/OHF-Voice/piper1-gpl)
 voice, the engine the HSR speaks with, so answers and self-hearing can be tried without the
 robot. It is for testing only: on the robot, speak through its speech node.
 
@@ -220,10 +240,10 @@ uv tool run --from piper-tts python -m piper.download_voices --data-dir voices e
 ```python
 from pathlib import Path
 
-from cramspeech.testing import Speaker
+from cramspeech.piper_speaker import Speaker
 
 speaker = Speaker(voice_model=Path("voices/en_GB-jenny_dioco-medium.onnx"))
-with recognizer.pause():
+with recognizer.microphone.mute():
     speaker.say(text="Hello, I am Toya.")          # returns once the sentence was played
 ```
 
@@ -241,5 +261,6 @@ CRAM_ORM_BUILD=never python -m pytest test/cramspeech_test --confcutdir=test/cra
 | `NothingHeard` | nobody starts speaking within the timeout of `hear_next_utterance` |
 | `MicrophoneStopped` | the input device stops delivering audio, for example when it is unplugged |
 | `SampleRateMismatch` | a recording reaches a model at a sample rate the model does not take |
+| `AlreadyListening` | a `BackgroundListener` that already listens is entered again |
 
-All three live in `cramspeech.exceptions`.
+All four live in `cramspeech.exceptions`.

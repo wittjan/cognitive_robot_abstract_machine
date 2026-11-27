@@ -1,6 +1,7 @@
 """
 Errors of listening and transcribing: audio at the wrong sample rate, nobody speaking in
-time, and a microphone that stopped delivering audio.
+time, a background listener entered twice, and a microphone that stopped delivering
+audio.
 """
 
 from __future__ import annotations
@@ -56,6 +57,22 @@ class NothingHeard(DataclassException):
         return (
             "Speak while the microphone listens, allow a longer timeout, or check that "
             "the microphone's device is the input being spoken into."
+        )
+
+
+@dataclass(kw_only=True)
+class AlreadyListening(DataclassException):
+    """
+    Raised when a background listener that already listens is entered again.
+    """
+
+    def error_message(self) -> str:
+        return "The background listener is already listening."
+
+    def suggest_correction(self) -> str:
+        return (
+            "Leave the listener's with statement before entering it again; a second "
+            "listener on the same microphone would hear every sentence twice."
         )
 
 

@@ -118,6 +118,12 @@ class WhisperTranscriber:
     """
     Words and phrases the speech is likely to hold, such as names and objects, so that
     Whisper prefers them over similar sounding words.
+
+    .. note::
+        faster-whisper keeps only the first 223 tokens of the hotwords, half of
+        Whisper's context of 448 tokens, and drops the rest without warning. With its
+        comma an English word takes about 2 tokens and a German compound up to 6, so
+        about 90 English or 40 German hotwords fit. List the most important ones first.
     """
 
     @cached_property

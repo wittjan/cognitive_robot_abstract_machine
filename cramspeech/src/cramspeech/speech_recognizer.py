@@ -5,16 +5,17 @@ a time, or in the background while a plan goes on.
 
 from __future__ import annotations
 
-from contextlib import closing, contextmanager
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass, field
 from math import ceil
 from queue import Queue
-from threading import Event, Thread
+from threading import Event
 
 import numpy as np
-from typing_extensions import Iterator
+from typing_extensions import Iterator, Self
 
-from cramspeech.exceptions import NothingHeard
+from cramspeech.exceptions import AlreadyListening, NothingHeard
 from cramspeech.microphone import Microphone, Recording
 from cramspeech.speech_detection import SpeechDetector, UtteranceSearch
 from cramspeech.transcription import Transcript, WhisperTranscriber
@@ -26,6 +27,9 @@ class SpeechRecognizer:
     """
     Hears speech from a microphone and transcribes it, either for a fixed time or one
     utterance at a time.
+
+    Muting the microphone drops the utterance under way, also when its audio is read
+    only after the mute.
     """
 
     microphone: Microphone = field(default_factory=Microphone)
@@ -48,21 +52,6 @@ class SpeechRecognizer:
     Seconds of audio streamed from the microphone between two searches for a finished
     utterance.
     """
-
-    @contextmanager
-    def pause(self) -> Iterator[None]:
-        """
-        Stop hearing while the ``with`` statement runs, for example while the robot
-        speaks.
-
-        Audio arriving meanwhile is dropped, with any utterance under way when the pause
-        began, also when it is read only after the pause.
-        """
-        self.microphone.is_muted.set()
-        try:
-            yield
-        finally:
-            self.microphone.is_muted.clear()
 
     def hear(self, *, duration: float) -> Transcript:
         """
@@ -122,8 +111,9 @@ class SpeechRecognizer:
         Listen to the microphone until the caller stops iterating, which releases it.
 
         :return: After each block of :attr:`block_duration`, the search of the audio
-            heard so far, without the utterances already found. A block that arrived
-            during :meth:`pause` yields an empty search.
+            heard so far, without the utterances already found. A block the microphone
+            dropped during a :meth:`~cramspeech.microphone.Microphone.mute` yields an
+            empty search.
         :raises MicrophoneStopped: When the microphone stops delivering audio.
         """
         sample_rate = self.transcriber.sample_rate
@@ -152,8 +142,8 @@ class SpeechRecognizer:
 @dataclass(kw_only=True)
 class BackgroundListener:
     """
-    Hears utterances in a thread of its own while the caller goes on, and keeps the
-    sentences in a queue until the caller reads them.
+    Hears utterances in a thread of its own while its ``with`` statement runs, and keeps
+    the sentences until the caller takes them.
     """
 
     recognizer: SpeechRecognizer
@@ -163,29 +153,44 @@ class BackgroundListener:
 
     heard: Queue[Transcript] = field(default_factory=Queue, init=False)
     """
-    Every sentence heard since :meth:`start`, in spoken order, until it is read.
+    Every sentence heard and not yet taken, in spoken order.
     """
 
     stop_requested: Event = field(default_factory=Event, init=False)
     """
-    Set by :meth:`stop` to end the listening.
+    Set when the ``with`` statement ends, to end the listening.
     """
 
-    thread: Thread | None = field(default=None, init=False)
+    listening: Future[None] | None = field(default=None, init=False)
     """
-    The thread that listens, ``None`` before :meth:`start`.
+    The listening in the background, ``None`` outside the ``with`` statement.
     """
 
-    def start(self) -> None:
+    def __enter__(self) -> Self:
         """
         Begin listening in a new thread and return at once.
 
-        The thread does not keep the process alive, so a listener nobody stopped ends
-        with the program.
+        :raises AlreadyListening: When the listener is already listening.
         """
+        if self.listening is not None:
+            raise AlreadyListening()
         self.stop_requested.clear()
-        self.thread = Thread(target=self.queue_heard_sentences, daemon=True)
-        self.thread.start()
+        executor = ThreadPoolExecutor(max_workers=1)
+        self.listening = executor.submit(self.queue_heard_sentences)
+        executor.shutdown(wait=False)
+        return self
+
+    def __exit__(self, *exception_information: object) -> None:
+        """
+        Stop listening at the next block, after the transcription under way if any, and
+        wait until the microphone is released.
+
+        :raises MicrophoneStopped: When the microphone stopped delivering audio.
+        """
+        self.stop_requested.set()
+        listening = self.listening
+        self.listening = None
+        listening.result()
 
     def queue_heard_sentences(self) -> None:
         """
@@ -199,10 +204,13 @@ class BackgroundListener:
         ):
             self.heard.put(transcript)
 
-    def stop(self) -> None:
+    def take_heard_sentences(self) -> list[Transcript]:
         """
-        Stop listening at the next block, after the transcription under way if any, and
-        wait until the microphone is released.
+        :return: Every sentence heard and not yet taken, in spoken order.
+        :raises MicrophoneStopped: When every sentence has been taken and the microphone
+            stopped delivering audio.
         """
-        self.stop_requested.set()
-        self.thread.join()
+        sentences = [self.heard.get() for _ in range(self.heard.qsize())]
+        if not sentences and self.listening is not None and self.listening.done():
+            self.listening.result()
+        return sentences

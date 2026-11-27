@@ -26,9 +26,6 @@ keywords = ["robotics", "speech recognition", "whisper", "pycram"]
 requires-python = ">=3.11"
 
 
-[project.scripts]
-nlp-listen = "cramspeech.speech_node:ListenCommandLine.run"
-
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["cramspeech*"]

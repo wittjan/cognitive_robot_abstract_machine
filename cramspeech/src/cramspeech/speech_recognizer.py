@@ -1,187 +1,39 @@
 """
-Turning the captured audio into text, detect where somebody spoke and paused, and
-transcribing each utterance.
+Hearing speech from a microphone and transcribing it, for a fixed time, one utterance at
+a time, or in the background while a plan goes on.
 """
 
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
-from functools import cached_property
 from math import ceil
+from queue import Queue
+from threading import Event, Thread
 
 import numpy as np
-from faster_whisper.vad import SileroVADModel, get_vad_model
-from krrood.patterns.classproperty import classproperty
 from typing_extensions import Iterator
 
-from cramspeech.exceptions import NothingHeard, SampleRateMismatch
+from cramspeech.exceptions import NothingHeard
 from cramspeech.microphone import Microphone, Recording
+from cramspeech.speech_detection import SpeechDetector, UtteranceSearch
 from cramspeech.transcription import Transcript, WhisperTranscriber
 
 
-# %% Speech detection
-@dataclass
-class UtteranceSearch:
-    """
-    What a :class:`SpeechDetector` found when it searched audio for an utterance.
-    """
-
-    utterance: Recording | None
-    """
-    The first finished utterance with its lead-in, ``None`` while nobody spoke or the
-    speaker is still talking.
-    """
-
-    holds_speech: bool
-    """
-    Whether the searched audio holds any speech.
-    """
-
-    first_sample_to_keep: int
-    """
-    Index of the first sample of the searched audio that later searches still need.
-    """
-
-
-@dataclass
-class SpeechDetector:
-    """
-    Finds where somebody spoke and then paused, using the Silero voice activity model
-    that ships with faster-whisper.
-    """
-
-    speech_threshold: float = 0.5
-    """
-    Score from which the model counts a frame as speech, between 0 and 1.
-    """
-
-    pause_duration: float = 1.0
-    """
-    Seconds without speech after which an utterance is finished.
-    """
-
-    kept_before_speech: float = 0.4
-    """
-    Seconds of audio kept before the first speech frame, so the first word is not cut
-    off.
-    """
-
-    maximum_duration: float = 30.0
-    """
-    Longest utterance, in seconds.
-
-    Speech that goes on longer is cut off there.
-    """
-
-    @cached_property
-    def model(self) -> SileroVADModel:
-        """
-        The Silero model that scores how likely each frame holds speech.
-        """
-        return get_vad_model()
-
-    @classproperty
-    def sample_rate(cls) -> int:
-        """
-        :return: Samples per second, in hertz, that Silero expects its recordings at.
-        """
-        return 16000
-
-    @classproperty
-    def frame_length(cls) -> int:
-        """
-        :return: Number of samples the model scores at once.
-        """
-        return 512
-
-    def search_for_utterance(self, recording: Recording) -> UtteranceSearch:
-        """
-        :param recording: Audio at :attr:`sample_rate`, oldest sample first.
-        :return: The first utterance that ended in a pause of :attr:`pause_duration` or
-            reached :attr:`maximum_duration`, with :attr:`kept_before_speech` of audio
-            before it, and the part of the audio later searches still need.
-        :raises SampleRateMismatch: When the recording is not at :attr:`sample_rate`.
-        """
-        speech_frames = self.speech_frames_in(recording)
-        frame_count = len(recording.waveform) // self.frame_length
-        lead_in = round(self.kept_before_speech * self.sample_rate)
-        if speech_frames.size == 0:
-            frames_before_lead_in = (len(recording.waveform) - lead_in) // (
-                self.frame_length
-            )
-            return UtteranceSearch(
-                utterance=None,
-                holds_speech=False,
-                first_sample_to_keep=max(0, frames_before_lead_in * self.frame_length),
-            )
-
-        start = max(0, int(speech_frames[0]) * self.frame_length - lead_in)
-        maximum_end = start + round(self.maximum_duration * self.sample_rate)
-        pause_start = self.start_of_first_pause(speech_frames, frame_count)
-        if pause_start is None and len(recording.waveform) < maximum_end:
-            return UtteranceSearch(
-                utterance=None, holds_speech=True, first_sample_to_keep=0
-            )
-        end = maximum_end if pause_start is None else min(pause_start, maximum_end)
-        utterance = Recording(
-            waveform=recording.waveform[start:end], sample_rate=recording.sample_rate
-        )
-        return UtteranceSearch(
-            utterance=utterance, holds_speech=True, first_sample_to_keep=end
-        )
-
-    def speech_frames_in(self, recording: Recording) -> np.ndarray:
-        """
-        :param recording: Audio at :attr:`sample_rate`, oldest sample first.
-        :return: Indices of the whole frames that hold speech, in ascending order.
-        :raises SampleRateMismatch: When the recording is not at :attr:`sample_rate`.
-        """
-        if recording.sample_rate != self.sample_rate:
-            raise SampleRateMismatch(
-                recording_sample_rate=recording.sample_rate,
-                model_sample_rate=self.sample_rate,
-            )
-        frame_count = len(recording.waveform) // self.frame_length
-        if frame_count == 0:
-            return np.zeros(0, dtype=np.int64)
-        scores = self.model(recording.waveform[: frame_count * self.frame_length])
-        return np.flatnonzero(scores >= self.speech_threshold)
-
-    def start_of_first_pause(
-        self, speech_frames: np.ndarray, frame_count: int
-    ) -> int | None:
-        """
-        :param speech_frames: Indices of the frames that hold speech, in ascending order.
-        :param frame_count: Number of frames scored.
-        :return: The sample at which the first silence of at least
-            :attr:`pause_duration` begins, ``None`` if the speaker has not paused that
-            long yet.
-        """
-        pause_frame_count = ceil(
-            self.pause_duration * self.sample_rate / self.frame_length
-        )
-        frames_to_next_speech = np.diff(speech_frames, append=frame_count)
-        paused_after = np.flatnonzero(frames_to_next_speech > pause_frame_count)
-        if paused_after.size == 0:
-            return None
-        return (int(speech_frames[paused_after[0]]) + 1) * self.frame_length
-
-
 # %% Speech recognizer
-@dataclass
+@dataclass(kw_only=True)
 class SpeechRecognizer:
     """
     Hears speech from a microphone and transcribes it, either for a fixed time or one
     utterance at a time.
     """
 
-    microphone: Microphone
+    microphone: Microphone = field(default_factory=Microphone)
     """
     The device the speech is recorded from.
     """
 
-    transcriber: WhisperTranscriber
+    transcriber: WhisperTranscriber = field(default_factory=WhisperTranscriber)
     """
     The speech-to-text model that turns the recording into text.
     """
@@ -197,7 +49,22 @@ class SpeechRecognizer:
     utterance.
     """
 
-    def hear(self, duration: float) -> Transcript:
+    @contextmanager
+    def pause(self) -> Iterator[None]:
+        """
+        Stop hearing while the ``with`` statement runs, for example while the robot
+        speaks.
+
+        Audio arriving meanwhile is dropped, with any utterance under way when the pause
+        began, also when it is read only after the pause.
+        """
+        self.microphone.is_muted.set()
+        try:
+            yield
+        finally:
+            self.microphone.is_muted.clear()
+
+    def hear(self, *, duration: float) -> Transcript:
         """
         Record for a fixed time, starting now, and return what was said.
 
@@ -207,9 +74,9 @@ class SpeechRecognizer:
         recording = self.microphone.record(
             duration=duration, sample_rate=self.transcriber.sample_rate
         )
-        return self.transcriber.transcribe(recording)
+        return self.transcriber.transcribe(recording=recording)
 
-    def hear_next_utterance(self, timeout: float) -> Transcript:
+    def hear_next_utterance(self, *, timeout: float) -> Transcript:
         """
         Listen until somebody has spoken and paused, and return what was said.
 
@@ -223,33 +90,44 @@ class SpeechRecognizer:
         with closing(self._listen()) as searches:
             for block_count, search in enumerate(searches, start=1):
                 if search.utterance is not None:
-                    return self.transcriber.transcribe(search.utterance)
+                    return self.transcriber.transcribe(recording=search.utterance)
                 if block_count >= timeout_block_count and not search.holds_speech:
                     raise NothingHeard(timeout=timeout)
 
-    def hear_utterances(self) -> Iterator[Transcript]:
+    def hear_utterances(
+        self, *, stop_requested: Event | None = None
+    ) -> Iterator[Transcript]:
         """
-        Listen until the caller stops iterating, which releases the microphone.
+        Listen until *stop_requested* is set or the caller stops iterating, which
+        releases the microphone.
 
-        :return: The text of every utterance, in spoken order, each as soon as its pause
-            has been heard.
+        :param stop_requested: Ends listening at the next block once set, also while
+            nobody speaks, and after the transcription under way, if any.
+        :return: The text of every utterance with words in it, in spoken order, each as
+            soon as its pause has been heard.
         :raises MicrophoneStopped: When the microphone stops delivering audio.
         """
         with closing(self._listen()) as searches:
             for search in searches:
-                if search.utterance is not None:
-                    yield self.transcriber.transcribe(search.utterance)
+                if stop_requested is not None and stop_requested.is_set():
+                    return
+                if search.utterance is None:
+                    continue
+                transcript = self.transcriber.transcribe(recording=search.utterance)
+                if transcript.text:
+                    yield transcript
 
     def _listen(self) -> Iterator[UtteranceSearch]:
         """
         Listen to the microphone until the caller stops iterating, which releases it.
 
         :return: After each block of :attr:`block_duration`, the search of the audio
-            heard so far, without the utterances already found.
+            heard so far, without the utterances already found. A block that arrived
+            during :meth:`pause` yields an empty search.
         :raises MicrophoneStopped: When the microphone stops delivering audio.
         """
         sample_rate = self.transcriber.sample_rate
-        heard = Recording(
+        kept_audio = Recording(
             waveform=np.zeros(0, dtype=np.float32), sample_rate=sample_rate
         )
         with closing(
@@ -258,7 +136,73 @@ class SpeechRecognizer:
             )
         ) as blocks:
             for block in blocks:
-                heard.waveform = np.concatenate((heard.waveform, block))
-                search = self.detector.search_for_utterance(heard)
-                heard.waveform = heard.waveform[search.first_sample_to_keep :]
+                if block.size == 0:
+                    kept_audio.waveform = kept_audio.waveform[:0]
+                    yield UtteranceSearch(
+                        utterance=None, holds_speech=False, first_sample_to_keep=0
+                    )
+                    continue
+                kept_audio.waveform = np.concatenate((kept_audio.waveform, block))
+                search = self.detector.search_for_utterance(recording=kept_audio)
+                kept_audio.waveform = kept_audio.waveform[search.first_sample_to_keep :]
                 yield search
+
+
+# %% Listening in the background
+@dataclass(kw_only=True)
+class BackgroundListener:
+    """
+    Hears utterances in a thread of its own while the caller goes on, and keeps the
+    sentences in a queue until the caller reads them.
+    """
+
+    recognizer: SpeechRecognizer
+    """
+    Hears and transcribes the utterances.
+    """
+
+    heard: Queue[Transcript] = field(default_factory=Queue, init=False)
+    """
+    Every sentence heard since :meth:`start`, in spoken order, until it is read.
+    """
+
+    stop_requested: Event = field(default_factory=Event, init=False)
+    """
+    Set by :meth:`stop` to end the listening.
+    """
+
+    thread: Thread | None = field(default=None, init=False)
+    """
+    The thread that listens, ``None`` before :meth:`start`.
+    """
+
+    def start(self) -> None:
+        """
+        Begin listening in a new thread and return at once.
+
+        The thread does not keep the process alive, so a listener nobody stopped ends
+        with the program.
+        """
+        self.stop_requested.clear()
+        self.thread = Thread(target=self.queue_heard_sentences, daemon=True)
+        self.thread.start()
+
+    def queue_heard_sentences(self) -> None:
+        """
+        Put every sentence the recognizer hears into :attr:`heard` until
+        :attr:`stop_requested` is set.
+
+        :raises MicrophoneStopped: When the microphone stops delivering audio.
+        """
+        for transcript in self.recognizer.hear_utterances(
+            stop_requested=self.stop_requested
+        ):
+            self.heard.put(transcript)
+
+    def stop(self) -> None:
+        """
+        Stop listening at the next block, after the transcription under way if any, and
+        wait until the microphone is released.
+        """
+        self.stop_requested.set()
+        self.thread.join()

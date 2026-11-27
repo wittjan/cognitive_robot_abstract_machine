@@ -23,18 +23,19 @@ from .dataset.stand_ins import (
 )
 
 
-# %% Recording request
-def test_record_requests_the_duration_at_the_sample_rate(
+# %% Recording
+def test_record_requests_the_duration_and_returns_a_mono_recording(
     silent_input_device: SilentInputDevice,
 ) -> None:
     """
     The driver is asked for one mono float32 channel on the chosen device, with as many
-    frames as the duration lasts at the sample rate.
+    frames as the duration lasts at the sample rate, and that channel becomes the
+    waveform, tagged with its sample rate.
     """
     microphone = Microphone(device="USB microphone")
     sample_rate = WhisperTranscriber.sample_rate
 
-    microphone.record(duration=1.5, sample_rate=sample_rate)
+    recording = microphone.record(duration=1.5, sample_rate=sample_rate)
 
     assert silent_input_device.requests == [
         {
@@ -45,22 +46,7 @@ def test_record_requests_the_duration_at_the_sample_rate(
             "device": microphone.device,
         }
     ]
-
-
-# %% Recorded audio
-def test_record_returns_the_frames_as_a_mono_recording(
-    silent_input_device: SilentInputDevice,
-) -> None:
-    """
-    The single recorded channel becomes the waveform, one sample per frame, tagged with
-    the sample rate it was recorded at.
-    """
-    sample_rate = WhisperTranscriber.sample_rate
-
-    recording = Microphone().record(duration=1.0, sample_rate=sample_rate)
-
-    [request] = silent_input_device.requests
-    assert recording.waveform.shape == (request["frames"],)
+    assert recording.waveform.shape == (3 * sample_rate // 2,)
     assert recording.waveform.dtype == np.float32
     assert recording.sample_rate == sample_rate
 
@@ -112,6 +98,31 @@ def test_stream_keeps_every_block_in_recording_order(
     streamed = np.concatenate([next(blocks) for _ in range(block_count)])
 
     assert np.array_equal(streamed, recording.waveform)
+
+
+def test_stream_empties_blocks_that_arrive_while_muted(
+    replay_through_the_microphone: Callable[[Recording], ReplayingInputDevice],
+) -> None:
+    """
+    A block that arrives while the microphone is muted stays empty, also when the caller
+    reads it after the microphone was unmuted.
+    """
+    sample_rate = WhisperTranscriber.sample_rate
+    replay_through_the_microphone(
+        NonSpeechRecording(sound=NonSpeechSound.WHITE_NOISE).recording(
+            sample_rate=sample_rate
+        )
+    )
+    microphone = Microphone()
+    microphone.is_muted.set()
+    blocks = microphone.stream(sample_rate=sample_rate, block_duration=0.25)
+
+    read_while_muted = next(blocks)
+    microphone.is_muted.clear()
+    read_after_unmuting = next(blocks)
+
+    assert read_while_muted.size == 0
+    assert read_after_unmuting.size == 0
 
 
 def test_stream_raises_when_the_device_stops_delivering(
@@ -201,23 +212,16 @@ def test_only_devices_that_record_are_listed(
     assert InputDevice.list_available() == expected
 
 
-def test_input_device_reads_as_its_index_and_name() -> None:
+@pytest.mark.parametrize("is_default", [False, True])
+def test_input_device_reads_as_its_index_and_name(is_default: bool) -> None:
     """
-    The line names the index and the name, the two ways to choose the device.
+    The line names the index and the name, the two ways to choose the device, after a
+    star for the system's default input, as ``python -m sounddevice`` shows it.
     """
-    device = InputDevice(index=6, name="USB headset", is_default=False)
+    device = InputDevice(index=6, name="USB headset", is_default=is_default)
 
-    assert str(device).split() == [str(device.index), *device.name.split()]
-
-
-def test_default_input_device_is_marked() -> None:
-    """
-    The system's default input starts with a star, as ``python -m sounddevice`` shows
-    it.
-    """
-    device = InputDevice(index=6, name="USB headset", is_default=True)
-
-    assert str(device).split()[0] == "*"
+    marker = ["*"] if is_default else []
+    assert str(device).split() == [*marker, str(device.index), *device.name.split()]
 
 
 # %% Real microphone

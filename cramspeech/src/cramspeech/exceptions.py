@@ -11,7 +11,7 @@ from krrood.exceptions import DataclassException
 
 
 # %% Transcription
-@dataclass
+@dataclass(kw_only=True)
 class SampleRateMismatch(DataclassException):
     """
     Raised when a recording reaches a model at a sample rate the model does not take.
@@ -38,7 +38,7 @@ class SampleRateMismatch(DataclassException):
 
 
 # %% Listening
-@dataclass
+@dataclass(kw_only=True)
 class NothingHeard(DataclassException):
     """
     Raised when nobody starts speaking while the microphone is listening.
@@ -60,7 +60,7 @@ class NothingHeard(DataclassException):
 
 
 # %% Microphone
-@dataclass
+@dataclass(kw_only=True)
 class MicrophoneStopped(DataclassException):
     """
     Raised when an input device stops delivering audio while it is being listened to.

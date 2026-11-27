@@ -6,18 +6,19 @@ of them.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import Queue
+from threading import Event
 
 import numpy as np
 import sounddevice
 from typing_extensions import Any, Iterator
 
-from cramspeech.exceptions import MicrophoneStopped
+from cramspeech.exceptions import MicrophoneStopped, SampleRateMismatch
 
 
 # %% Recording
-@dataclass
+@dataclass(kw_only=True)
 class Recording:
     """
     Mono audio as a sequence of samples taken at a fixed rate.
@@ -33,9 +34,21 @@ class Recording:
     Samples per second, in hertz.
     """
 
+    def require_sample_rate(self, *, model_sample_rate: int) -> None:
+        """
+        :param model_sample_rate: Samples per second, in hertz, the model this recording
+            is handed to takes.
+        :raises SampleRateMismatch: When the recording is at another sample rate.
+        """
+        if self.sample_rate != model_sample_rate:
+            raise SampleRateMismatch(
+                recording_sample_rate=self.sample_rate,
+                model_sample_rate=model_sample_rate,
+            )
+
 
 # %% Input devices
-@dataclass
+@dataclass(kw_only=True)
 class InputDevice:
     """
     An audio device that can record, as sounddevice lists it.
@@ -84,7 +97,7 @@ class InputDevice:
 
 
 # %% Microphone
-@dataclass
+@dataclass(kw_only=True)
 class Microphone:
     """
     An audio input device that records mono audio on request.
@@ -97,7 +110,12 @@ class Microphone:
     ``None`` selects the system's default input.
     """
 
-    def record(self, duration: float, sample_rate: int) -> Recording:
+    is_muted: Event = field(default_factory=Event, init=False, compare=False)
+    """
+    Set while every arriving block is to be dropped.
+    """
+
+    def record(self, *, duration: float, sample_rate: int) -> Recording:
         """
         Record from the device, returning once the recording is complete.
 
@@ -115,12 +133,15 @@ class Microphone:
         sounddevice.wait()
         return Recording(waveform=frames[:, 0], sample_rate=sample_rate)
 
-    def stream(self, sample_rate: int, block_duration: float) -> Iterator[np.ndarray]:
+    def stream(
+        self, *, sample_rate: int, block_duration: float
+    ) -> Iterator[np.ndarray]:
         """
         Listen to the device until the caller stops iterating, which releases it.
 
         Audio that arrives while the caller is busy is kept until it is read. A block
-        after audio the device lost is logged as a warning.
+        that arrives while :attr:`is_muted` is set is empty. A block after audio the
+        device lost is logged as a warning.
 
         :param sample_rate: Samples per second to record, in hertz.
         :param block_duration: Length of each block, in seconds.
@@ -137,14 +158,15 @@ class Microphone:
             status: sounddevice.CallbackFlags,
         ) -> None:
             """
-            Queue a copy of the block that just arrived, warning first when audio was
-            lost before it.
+            Queue a copy of the block that just arrived, empty while muted, warning
+            first when audio was lost before it.
             """
             if status.input_overflow:
                 logging.getLogger(__name__).warning(
                     f"The input device {self.device!r} lost audio before this block."
                 )
-            arrived_blocks.put(samples[:, 0].copy())
+            kept_length = 0 if self.is_muted.is_set() else frame_count
+            arrived_blocks.put(samples[:kept_length, 0].copy())
 
         with sounddevice.InputStream(
             samplerate=sample_rate,

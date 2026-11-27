@@ -48,7 +48,7 @@ class CompletionKey(StrEnum):
     """
 
 
-@dataclass
+@dataclass(kw_only=True)
 class ModelAnswer:
     """
     What the language model wrote for one instruction.
@@ -60,7 +60,7 @@ class ModelAnswer:
     """
 
     @classmethod
-    def from_json(cls, payload: dict[str, Any]) -> ModelAnswer:
+    def from_json(cls, *, payload: dict[str, Any]) -> ModelAnswer:
         """
         :param payload: The model's completion with one choice, as llama.cpp returns it.
         :return: The answer the completion holds.
@@ -88,7 +88,7 @@ class ComputeDevice(IntEnum):
     """
 
 
-@dataclass
+@dataclass(kw_only=True)
 class PlanModel:
     """
     Turns a spoken instruction into plans with a trained language model in GGUF format.
@@ -157,7 +157,7 @@ class PlanModel:
         """
         return LlamaGrammar.from_file(InferenceResourcePath.PLAN_GRAMMAR, verbose=False)
 
-    def write_plans(self, instruction: str) -> InstructionPlans:
+    def write_plans(self, *, instruction: str) -> InstructionPlans:
         """
         :param instruction: The spoken instruction.
         :return: One plan per task of the instruction.
@@ -171,5 +171,5 @@ class PlanModel:
             repeat_penalty=self.no_repetition_penalty,
             grammar=self.grammar,
         )
-        answer = ModelAnswer.from_json(completion)
-        return InstructionPlans.from_json(json.loads(answer.text))
+        answer = ModelAnswer.from_json(payload=completion)
+        return InstructionPlans.from_json(payload=json.loads(answer.text))

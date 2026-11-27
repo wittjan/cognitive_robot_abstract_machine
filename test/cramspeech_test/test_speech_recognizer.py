@@ -9,19 +9,34 @@ from itertools import islice
 
 import numpy as np
 import pytest
-from cramspeech.exceptions import NothingHeard
+from cramspeech.exceptions import MicrophoneStopped, NothingHeard
 from cramspeech.microphone import Microphone, Recording
-from cramspeech.speech_recognizer import SpeechDetector, SpeechRecognizer
+from cramspeech.speech_detection import SpeechDetector
+from cramspeech.speech_recognizer import BackgroundListener, SpeechRecognizer
 from cramspeech.transcription import Transcript, WhisperTranscriber
 from typing_extensions import Callable
 
 from .dataset.non_speech import NonSpeechRecording, NonSpeechSound, SoundSequence
 from .dataset.stand_ins import (
+    LiveInputDevice,
     ModelHearingSpeechInEverySound,
     ModelReturningSegments,
     ReplayingInputDevice,
     SilentInputDevice,
 )
+
+
+# %% Defaults
+def test_recognizer_listens_to_the_default_input_with_default_whisper() -> None:
+    """
+    Without arguments a recognizer gets a microphone and a transcriber of its own, with
+    their defaults.
+    """
+    recognizer = SpeechRecognizer()
+
+    assert recognizer.microphone == Microphone()
+    assert recognizer.transcriber == WhisperTranscriber()
+    assert recognizer.transcriber is not SpeechRecognizer().transcriber
 
 
 # %% Hearing for a fixed time
@@ -61,7 +76,7 @@ def test_hear_next_utterance_returns_the_transcribed_speech(
 
     [(transcribed_audio, _)] = model_hearing_a_request.calls
     expected_utterance = recognizer_hearing_every_sound.detector.search_for_utterance(
-        recording
+        recording=recording
     ).utterance
     assert transcript == Transcript(text=model_hearing_a_request.texts[0])
     assert np.array_equal(transcribed_audio, expected_utterance.waveform)
@@ -155,8 +170,8 @@ def test_hear_utterances_yields_each_utterance_in_order(
     )
     expected_utterances = [
         recording.waveform[
-            sequence.start_of(speech, sample_rate=sample_rate) - lead_in : (
-                sequence.start_of(speech + 1, sample_rate=sample_rate)
+            sequence.start_of(position=speech, sample_rate=sample_rate) - lead_in : (
+                sequence.start_of(position=speech + 1, sample_rate=sample_rate)
             )
         ]
         for speech in (1, 3)
@@ -165,6 +180,34 @@ def test_hear_utterances_yields_each_utterance_in_order(
     assert transcripts == 2 * [Transcript(text=model_hearing_a_request.texts[0])]
     assert all(map(np.array_equal, transcribed_audio, expected_utterances))
     assert len(transcribed_audio) == len(expected_utterances)
+
+
+def test_hear_utterances_skips_utterances_without_words(
+    detector_hearing_every_sound: SpeechDetector,
+    transcriber_hearing: Callable[[ModelReturningSegments], WhisperTranscriber],
+    silence_then_speech_then_pause: SoundSequence,
+    replay_through_the_microphone: Callable[[Recording], ReplayingInputDevice],
+) -> None:
+    """
+    An utterance in which Whisper hears no words, such as a cough, is not yielded.
+    """
+    model_hearing_no_words = ModelReturningSegments(texts=[])
+    recognizer = SpeechRecognizer(
+        microphone=Microphone(),
+        transcriber=transcriber_hearing(model_hearing_no_words),
+        detector=detector_hearing_every_sound,
+    )
+    replay_through_the_microphone(
+        silence_then_speech_then_pause.recording(sample_rate=SpeechDetector.sample_rate)
+    )
+    transcripts = []
+
+    with pytest.raises(MicrophoneStopped):
+        for transcript in recognizer.hear_utterances():
+            transcripts.append(transcript)
+
+    assert len(model_hearing_no_words.calls) == 1
+    assert transcripts == []
 
 
 def test_hear_utterances_releases_the_microphone_when_the_caller_stops(
@@ -211,3 +254,86 @@ def test_listening_through_silence_keeps_only_the_lead_in(
     assert max(model.scored_sample_counts) < lead_in + SpeechDetector.frame_length + (
         block_length
     )
+
+
+# %% Pausing while the robot speaks
+def test_speech_heard_while_paused_is_not_transcribed(
+    recognizer_hearing_every_sound: SpeechRecognizer,
+    model_hearing_a_request: ModelReturningSegments,
+    silence_then_speech_then_pause: SoundSequence,
+    replay_through_the_microphone: Callable[[Recording], ReplayingInputDevice],
+) -> None:
+    """
+    What the microphone hears during a pause, such as the robot's own voice, never
+    reaches Whisper.
+    """
+    replay_through_the_microphone(
+        silence_then_speech_then_pause.recording(sample_rate=SpeechDetector.sample_rate)
+    )
+
+    with recognizer_hearing_every_sound.pause(), pytest.raises(MicrophoneStopped):
+        list(recognizer_hearing_every_sound.hear_utterances())
+
+    assert model_hearing_a_request.calls == []
+
+
+def test_hearing_resumes_after_the_pause(
+    recognizer_hearing_every_sound: SpeechRecognizer,
+    model_hearing_a_request: ModelReturningSegments,
+    silence_then_speech_then_pause: SoundSequence,
+    replay_through_the_microphone: Callable[[Recording], ReplayingInputDevice],
+) -> None:
+    """
+    Speech that arrives once the pause is over is transcribed again.
+    """
+    with recognizer_hearing_every_sound.pause():
+        pass
+    replay_through_the_microphone(
+        silence_then_speech_then_pause.recording(sample_rate=SpeechDetector.sample_rate)
+    )
+
+    transcript = next(recognizer_hearing_every_sound.hear_utterances())
+
+    assert transcript == Transcript(text=model_hearing_a_request.texts[0])
+
+
+# %% Listening in the background
+def test_background_listener_queues_what_it_hears(
+    recognizer_hearing_every_sound: SpeechRecognizer,
+    model_hearing_a_request: ModelReturningSegments,
+    silence_then_speech_then_pause: SoundSequence,
+    stream_through_the_microphone: Callable[[Recording], LiveInputDevice],
+    background_listener: BackgroundListener,
+) -> None:
+    """
+    Sentences heard while the caller does something else wait in the queue.
+    """
+    stream_through_the_microphone(
+        silence_then_speech_then_pause.recording(sample_rate=SpeechDetector.sample_rate)
+    )
+
+    background_listener.start()
+    transcript = background_listener.heard.get(timeout=5.0)
+
+    assert transcript == Transcript(text=model_hearing_a_request.texts[0])
+
+
+def test_background_listener_stops_during_silence(
+    stream_through_the_microphone: Callable[[Recording], LiveInputDevice],
+    background_listener: BackgroundListener,
+    stop_in_time: Callable[[BackgroundListener], bool],
+) -> None:
+    """
+    Stopping ends the listening thread while nobody speaks, and releases the microphone.
+    """
+    device = stream_through_the_microphone(
+        NonSpeechRecording(sound=NonSpeechSound.SILENCE, duration=1.0).recording(
+            sample_rate=SpeechDetector.sample_rate
+        )
+    )
+    background_listener.start()
+
+    assert stop_in_time(background_listener)
+    assert not background_listener.thread.is_alive()
+    assert not device.is_open
+    assert background_listener.heard.empty()

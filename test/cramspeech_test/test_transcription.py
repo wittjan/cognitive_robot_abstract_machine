@@ -33,14 +33,18 @@ def test_transcribe_passes_the_settings_to_the_model(
     one_second_of_silence: Recording,
 ) -> None:
     """
-    The language and beam size of the transcriber reach the model with the recorded
-    audio.
+    The language, beam size and hotwords of the transcriber reach the model with the
+    recorded audio, the hotwords as one hint phrase each.
     """
     model = ModelReturningSegments(texts=[])
-    transcriber = WhisperTranscriber(language=WhisperLanguage.GERMAN, beam_size=2)
+    transcriber = WhisperTranscriber(
+        language=WhisperLanguage.GERMAN,
+        beam_size=2,
+        hotwords=["Toya", "dishwasher tab"],
+    )
     transcriber.model = model
 
-    transcriber.transcribe(one_second_of_silence)
+    transcriber.transcribe(recording=one_second_of_silence)
 
     [(audio, settings)] = model.calls
     assert audio is one_second_of_silence.waveform
@@ -48,6 +52,7 @@ def test_transcribe_passes_the_settings_to_the_model(
         "language": transcriber.language,
         "beam_size": transcriber.beam_size,
         "vad_filter": True,
+        "hotwords": "Toya, dishwasher tab",
     }
 
 
@@ -65,7 +70,7 @@ def test_transcribe_joins_the_segments(
         ModelReturningSegments(texts=[" Bring me", " a cup."])
     )
 
-    assert transcriber.transcribe(one_second_of_silence) == Transcript(
+    assert transcriber.transcribe(recording=one_second_of_silence) == Transcript(
         text="Bring me a cup."
     )
 
@@ -83,7 +88,7 @@ def test_transcribe_rejects_a_recording_at_another_sample_rate(
     )
 
     with pytest.raises(SampleRateMismatch):
-        transcriber.transcribe(recording)
+        transcriber.transcribe(recording=recording)
 
 
 # %% No speech
@@ -99,7 +104,7 @@ def test_whisper_hears_nothing_without_speech(non_speech_recording: Recording) -
     """
     transcriber = WhisperTranscriber(model_size=WhisperModelSize.BASE)
 
-    assert transcriber.transcribe(non_speech_recording) == Transcript(text="")
+    assert transcriber.transcribe(recording=non_speech_recording) == Transcript(text="")
 
 
 # %% Compute type

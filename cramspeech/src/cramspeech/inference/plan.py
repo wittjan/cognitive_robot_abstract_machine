@@ -100,7 +100,7 @@ class PlanAction(StrEnum):
     """
 
 
-@dataclass
+@dataclass(kw_only=True)
 class PlanStep:
     """
     One action of a plan, with the words of the instruction it acts on.
@@ -134,7 +134,7 @@ class PlanStep:
     """
 
     @classmethod
-    def from_json(cls, payload: dict[str, str]) -> PlanStep:
+    def from_json(cls, *, payload: dict[str, str]) -> PlanStep:
         """
         :param payload: One step of the plan JSON.
         :return: The step the payload describes.
@@ -149,7 +149,7 @@ class PlanStep:
 
 
 # %% Plans
-@dataclass
+@dataclass(kw_only=True)
 class Plan:
     """
     The steps that carry out one task of an instruction.
@@ -166,7 +166,7 @@ class Plan:
     """
 
     @classmethod
-    def from_json(cls, payload: list[dict[str, str]]) -> Plan:
+    def from_json(cls, *, payload: list[dict[str, str]]) -> Plan:
         """
         :param payload: One plan of the plan JSON, opening with a ``say`` step that holds
             the summary.
@@ -175,11 +175,11 @@ class Plan:
         summary, *steps = payload
         return cls(
             summary=summary[PlanKey.TEXT],
-            steps=[PlanStep.from_json(step) for step in steps],
+            steps=[PlanStep.from_json(payload=step) for step in steps],
         )
 
 
-@dataclass
+@dataclass(kw_only=True)
 class InstructionPlans:
     """
     The plans for one spoken instruction, one per task it asks for.
@@ -191,9 +191,11 @@ class InstructionPlans:
     """
 
     @classmethod
-    def from_json(cls, payload: dict[str, Any]) -> InstructionPlans:
+    def from_json(cls, *, payload: dict[str, Any]) -> InstructionPlans:
         """
         :param payload: The plan JSON the model wrote for the instruction.
         :return: The plans the payload describes.
         """
-        return cls(plans=[Plan.from_json(plan) for plan in payload[PlanKey.PLANS]])
+        return cls(
+            plans=[Plan.from_json(payload=plan) for plan in payload[PlanKey.PLANS]]
+        )

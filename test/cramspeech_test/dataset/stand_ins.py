@@ -1,51 +1,28 @@
 """
-Stand-ins for the microphone driver, the Whisper model and the Silero model, so tests
-run without audio hardware or a model download.
+Stand-ins for the microphone driver, the loudspeaker, the ``piper`` program, the Whisper
+model and the Silero model, so tests run without audio hardware, Piper or a model
+download.
 """
 
 from __future__ import annotations
 
 # %% Imports
+import subprocess
 from dataclasses import dataclass, field
+from itertools import chain, repeat
+from threading import Event, Thread
 
 import numpy as np
 import sounddevice
 from cramspeech.microphone import Recording
-from cramspeech.speech_recognizer import SpeechDetector
+from cramspeech.speech_detection import SpeechDetector
 from faster_whisper.transcribe import Segment
+from krrood.patterns.called_positionally import called_positionally
 from typing_extensions import Any, Callable, Iterator, Self
 
 
 # %% Microphone driver
-@dataclass
-class SilentInputDevice:
-    """
-    Takes the place of :func:`sounddevice.rec` and :func:`sounddevice.wait`: every
-    recording is silence of the requested shape, and every request is kept for
-    inspection.
-    """
-
-    requests: list[dict[str, Any]] = field(default_factory=list)
-    """
-    The keyword arguments of each :meth:`rec` call, in call order.
-    """
-
-    def rec(self, **arguments: Any) -> np.ndarray:
-        """
-        :return: Zeros with one row per requested frame and one column per channel.
-        """
-        self.requests.append(arguments)
-        return np.zeros(
-            (arguments["frames"], arguments["channels"]), dtype=arguments["dtype"]
-        )
-
-    def wait(self) -> None:
-        """
-        Returns at once, since :meth:`rec` finishes its recording immediately.
-        """
-
-
-@dataclass
+@dataclass(kw_only=True)
 class ReplayingInputDevice:
     """
     Takes the place of :class:`sounddevice.InputStream`: as soon as the stream opens,
@@ -89,6 +66,7 @@ class ReplayingInputDevice:
 
     def input_stream(
         self,
+        *,
         callback: Callable[[np.ndarray, int, Any, sounddevice.CallbackFlags], None],
         finished_callback: Callable[[], None],
         **arguments: Any,
@@ -110,17 +88,26 @@ class ReplayingInputDevice:
         Like PortAudio, every block reuses one buffer.
         """
         self.is_open = True
-        block_length = self.requests[-1]["blocksize"]
+        blocks = self.recorded_blocks()
+        block_length = blocks.shape[1]
         buffer = np.zeros((block_length, 1), dtype=np.float32)
         status = sounddevice.CallbackFlags()
         status.input_overflow = self.drops_audio
-        waveform = self.recording.waveform
-        for start in range(0, len(waveform), block_length):
-            block = waveform[start : start + block_length]
-            buffer[:, 0] = np.pad(block, (0, block_length - len(block)))
+        for block in blocks:
+            buffer[:, 0] = block
             self.callback(buffer, block_length, None, status)
         self.finished_callback()
         return self
+
+    def recorded_blocks(self) -> np.ndarray:
+        """
+        :return: The recording as one row per block of the latest stream's size, silence
+            filling up the last one.
+        """
+        block_length = self.requests[-1]["blocksize"]
+        waveform = self.recording.waveform
+        padded = np.pad(waveform, (0, -len(waveform) % block_length))
+        return padded.reshape(-1, block_length)
 
     def __exit__(self, *exception_information: object) -> None:
         """
@@ -129,7 +116,98 @@ class ReplayingInputDevice:
         self.is_open = False
 
 
-@dataclass
+@dataclass(kw_only=True)
+class LiveInputDevice(ReplayingInputDevice):
+    """
+    Takes the place of :class:`sounddevice.InputStream` like a microphone in a quiet
+    room:
+
+    from its own thread, plays the recording into the stream's callback and then
+    silence, block after block, until the stream is closed.
+    """
+
+    block_interval: float = 0.001
+    """
+    Seconds between two blocks, far shorter than a block lasts.
+    """
+
+    closed: Event = field(default_factory=Event)
+    """
+    Set once the stream is closed, which ends the delivery of blocks.
+    """
+
+    delivery: Thread | None = None
+    """
+    The thread that hands the blocks to the callback while the stream is open.
+    """
+
+    def __enter__(self) -> Self:
+        """
+        Opens the stream and starts delivering blocks of the requested size.
+        """
+        self.is_open = True
+        self.closed.clear()
+        self.delivery = Thread(target=self.deliver_blocks, daemon=True)
+        self.delivery.start()
+        return self
+
+    def deliver_blocks(self) -> None:
+        """
+        Hand the recording to the callback, silence filling up its last block, and then
+        silent blocks until the stream is closed.
+        """
+        recorded_blocks = self.recorded_blocks()
+        block_length = recorded_blocks.shape[1]
+        silence = np.zeros(block_length, dtype=np.float32)
+        blocks = chain(recorded_blocks, repeat(silence))
+        status = sounddevice.CallbackFlags()
+        for block in blocks:
+            if self.closed.wait(timeout=self.block_interval):
+                return
+            self.callback(block[:, np.newaxis], block_length, None, status)
+
+    def __exit__(self, *exception_information: object) -> None:
+        """
+        Closes the stream once the delivering thread has stopped.
+        """
+        self.closed.set()
+        self.delivery.join()
+        self.is_open = False
+
+
+@dataclass(kw_only=True)
+class SteppedInputDevice(ReplayingInputDevice):
+    """
+    Takes the place of :class:`sounddevice.InputStream` like a microphone whose blocks
+    arrive when the test says so: opening the stream delivers the first block of the
+    recording, and each :meth:`deliver_next_block` the one after.
+    """
+
+    delivered_block_count: int = 0
+    """
+    Number of blocks of the recording handed to the callback so far.
+    """
+
+    def __enter__(self) -> Self:
+        """
+        Opens the stream and delivers only the first block.
+        """
+        self.is_open = True
+        self.deliver_next_block()
+        return self
+
+    def deliver_next_block(self) -> None:
+        """
+        Hand the next block of the recording to the latest stream's callback.
+        """
+        block = self.recorded_blocks()[self.delivered_block_count]
+        self.delivered_block_count += 1
+        self.callback(
+            block[:, np.newaxis], len(block), None, sounddevice.CallbackFlags()
+        )
+
+
+@dataclass(kw_only=True)
 class AudioDevicesOfADesktop:
     """
     Takes the place of :func:`sounddevice.query_devices`: a desktop's devices, of which
@@ -159,7 +237,7 @@ class AudioDevicesOfADesktop:
         return self.devices
 
 
-@dataclass
+@dataclass(kw_only=True)
 class DefaultDevicesOfADesktop:
     """
     Takes the place of :data:`sounddevice.default`, holding only the default devices.
@@ -171,8 +249,71 @@ class DefaultDevicesOfADesktop:
     """
 
 
+# %% Piper and the loudspeaker
+@dataclass(kw_only=True)
+class PiperProgram:
+    """
+    Takes the place of :func:`subprocess.run` for the ``piper`` program: answers every
+    sentence with the same raw 16-bit audio and keeps every call.
+    """
+
+    samples: np.ndarray = field(
+        default_factory=lambda: np.array([0, 1000, -1000, 32767], dtype=np.int16)
+    )
+    """
+    The audio every sentence is spoken as.
+    """
+
+    calls: list[tuple[list[str], bytes]] = field(default_factory=list)
+    """
+    The command and the standard input of each call, in call order.
+    """
+
+    @called_positionally
+    def run(self, command: list[str], **settings: Any) -> subprocess.CompletedProcess:
+        """
+        :return: A finished process that wrote :attr:`samples` to its standard output.
+        """
+        self.calls.append((command, settings["input"]))
+        return subprocess.CompletedProcess(
+            args=command, returncode=0, stdout=self.samples.tobytes(), stderr=b""
+        )
+
+
+@dataclass(kw_only=True)
+class LoudspeakerKeepingWhatItPlays:
+    """
+    Takes the place of :func:`sounddevice.play` and :func:`sounddevice.wait`: plays
+    nothing aloud and keeps every played audio with its sample rate.
+    """
+
+    played: list[tuple[np.ndarray, int]] = field(default_factory=list)
+    """
+    The samples and the sample rate of each :meth:`play` call, in call order.
+    """
+
+    waited: bool = False
+    """
+    Whether :meth:`wait` was called after the latest :meth:`play`.
+    """
+
+    @called_positionally
+    def play(self, data: np.ndarray, samplerate: int) -> None:
+        """
+        Keep the audio instead of playing it.
+        """
+        self.played.append((data, samplerate))
+        self.waited = False
+
+    def wait(self) -> None:
+        """
+        Returns at once, since nothing is playing.
+        """
+        self.waited = True
+
+
 # %% Whisper model
-@dataclass
+@dataclass(kw_only=True)
 class ModelReturningSegments:
     """
     Takes the place of :class:`faster_whisper.WhisperModel`: hears the same texts in
@@ -189,6 +330,7 @@ class ModelReturningSegments:
     The audio and keyword arguments of each :meth:`transcribe` call, in call order.
     """
 
+    @called_positionally
     def transcribe(
         self, audio: np.ndarray, **settings: Any
     ) -> tuple[Iterator[Segment], None]:
@@ -217,7 +359,7 @@ class ModelReturningSegments:
 
 
 # %% Silero model
-@dataclass
+@dataclass(kw_only=True)
 class ModelHearingSpeechInEverySound:
     """
     Takes the place of :class:`faster_whisper.vad.SileroVADModel`: every frame that

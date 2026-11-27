@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from cramspeech.exceptions import SampleRateMismatch
 from cramspeech.microphone import Recording
-from cramspeech.speech_recognizer import SpeechDetector
+from cramspeech.speech_detection import SpeechDetector
 
 from .dataset.non_speech import NonSpeechRecording, NonSpeechSound, SoundSequence
 
@@ -25,7 +25,7 @@ def test_silence_holds_no_utterance(
     )
 
     utterance = detector_hearing_every_sound.search_for_utterance(
-        silence.recording(sample_rate=SpeechDetector.sample_rate)
+        recording=silence.recording(sample_rate=SpeechDetector.sample_rate)
     ).utterance
 
     assert utterance is None
@@ -50,7 +50,7 @@ def test_speech_without_a_pause_is_not_finished(
     )
 
     utterance = detector_hearing_every_sound.search_for_utterance(
-        sequence.recording(sample_rate=SpeechDetector.sample_rate)
+        recording=sequence.recording(sample_rate=SpeechDetector.sample_rate)
     ).utterance
 
     assert utterance is None
@@ -68,11 +68,13 @@ def test_speech_followed_by_a_pause_is_an_utterance(
     sequence = silence_then_speech_then_pause
     recording = sequence.recording(sample_rate=sample_rate)
 
-    utterance = detector_hearing_every_sound.search_for_utterance(recording).utterance
+    utterance = detector_hearing_every_sound.search_for_utterance(
+        recording=recording
+    ).utterance
 
     lead_in = round(detector_hearing_every_sound.kept_before_speech * sample_rate)
-    start = sequence.start_of(1, sample_rate=sample_rate) - lead_in
-    end = sequence.start_of(2, sample_rate=sample_rate)
+    start = sequence.start_of(position=1, sample_rate=sample_rate) - lead_in
+    end = sequence.start_of(position=2, sample_rate=sample_rate)
     assert np.array_equal(utterance.waveform, recording.waveform[start:end])
     assert utterance.sample_rate == sample_rate
 
@@ -91,10 +93,14 @@ def test_utterance_ends_at_the_first_pause(
     )
     recording = sequence.recording(sample_rate=sample_rate)
 
-    utterance = detector_hearing_every_sound.search_for_utterance(recording).utterance
+    utterance = detector_hearing_every_sound.search_for_utterance(
+        recording=recording
+    ).utterance
 
-    assert len(utterance.waveform) == sequence.start_of(2, sample_rate=sample_rate) - (
-        sequence.start_of(1, sample_rate=sample_rate)
+    assert len(utterance.waveform) == sequence.start_of(
+        position=2, sample_rate=sample_rate
+    ) - (
+        sequence.start_of(position=1, sample_rate=sample_rate)
         - round(detector_hearing_every_sound.kept_before_speech * sample_rate)
     )
 
@@ -119,9 +125,11 @@ def test_lead_in_stops_at_the_start_of_the_recording(
     )
     recording = sequence.recording(sample_rate=sample_rate)
 
-    utterance = detector_hearing_every_sound.search_for_utterance(recording).utterance
+    utterance = detector_hearing_every_sound.search_for_utterance(
+        recording=recording
+    ).utterance
 
-    end = sequence.start_of(2, sample_rate=sample_rate)
+    end = sequence.start_of(position=2, sample_rate=sample_rate)
     assert np.array_equal(utterance.waveform, recording.waveform[:end])
 
 
@@ -146,10 +154,12 @@ def test_speech_reaching_the_maximum_duration_is_an_utterance(
     )
     recording = sequence.recording(sample_rate=sample_rate)
 
-    utterance = detector_hearing_every_sound.search_for_utterance(recording).utterance
+    utterance = detector_hearing_every_sound.search_for_utterance(
+        recording=recording
+    ).utterance
 
     lead_in = round(detector_hearing_every_sound.kept_before_speech * sample_rate)
-    start = sequence.start_of(1, sample_rate=sample_rate) - lead_in
+    start = sequence.start_of(position=1, sample_rate=sample_rate) - lead_in
     end = start + round(detector_hearing_every_sound.maximum_duration * sample_rate)
     assert np.array_equal(utterance.waveform, recording.waveform[start:end])
 
@@ -178,7 +188,9 @@ def test_speech_longer_than_the_maximum_duration_is_cut_off_before_its_pause(
     )
     recording = sequence.recording(sample_rate=sample_rate)
 
-    utterance = detector_hearing_every_sound.search_for_utterance(recording).utterance
+    utterance = detector_hearing_every_sound.search_for_utterance(
+        recording=recording
+    ).utterance
 
     assert len(utterance.waveform) == round(
         detector_hearing_every_sound.maximum_duration * sample_rate
@@ -197,7 +209,7 @@ def test_silence_keeps_only_the_lead_in(
         sound=NonSpeechSound.SILENCE, duration=100 * frame_duration
     ).recording(sample_rate=SpeechDetector.sample_rate)
 
-    search = detector_hearing_every_sound.search_for_utterance(recording)
+    search = detector_hearing_every_sound.search_for_utterance(recording=recording)
 
     lead_in = round(
         detector_hearing_every_sound.kept_before_speech * SpeechDetector.sample_rate
@@ -218,7 +230,7 @@ def test_unfinished_speech_is_kept_whole(
     sequence = SoundSequence(sounds=silence_then_speech_then_pause.sounds[:2])
 
     search = detector_hearing_every_sound.search_for_utterance(
-        sequence.recording(sample_rate=SpeechDetector.sample_rate)
+        recording=sequence.recording(sample_rate=SpeechDetector.sample_rate)
     )
 
     assert search.first_sample_to_keep == 0
@@ -235,11 +247,11 @@ def test_audio_after_an_utterance_is_kept(
     sample_rate = SpeechDetector.sample_rate
 
     search = detector_hearing_every_sound.search_for_utterance(
-        silence_then_speech_then_pause.recording(sample_rate=sample_rate)
+        recording=silence_then_speech_then_pause.recording(sample_rate=sample_rate)
     )
 
     assert search.first_sample_to_keep == silence_then_speech_then_pause.start_of(
-        2, sample_rate=sample_rate
+        position=2, sample_rate=sample_rate
     )
 
 
@@ -255,7 +267,7 @@ def test_search_for_utterance_rejects_a_recording_at_another_sample_rate(
     )
 
     with pytest.raises(SampleRateMismatch):
-        detector_hearing_every_sound.search_for_utterance(recording)
+        detector_hearing_every_sound.search_for_utterance(recording=recording)
 
 
 # %% Real Silero model
@@ -265,7 +277,10 @@ def test_silero_finds_no_speech_without_speech(
     """
     The bundled Silero model hears no utterance in silence, noise or a tone.
     """
-    assert SpeechDetector().search_for_utterance(non_speech_recording).utterance is None
+    assert (
+        SpeechDetector().search_for_utterance(recording=non_speech_recording).utterance
+        is None
+    )
 
 
 def test_silero_finds_no_speech_in_less_than_a_frame(frame_duration: float) -> None:
@@ -276,4 +291,4 @@ def test_silero_finds_no_speech_in_less_than_a_frame(frame_duration: float) -> N
         sound=NonSpeechSound.TONE, duration=frame_duration / 2
     ).recording(sample_rate=SpeechDetector.sample_rate)
 
-    assert SpeechDetector().search_for_utterance(recording).utterance is None
+    assert SpeechDetector().search_for_utterance(recording=recording).utterance is None

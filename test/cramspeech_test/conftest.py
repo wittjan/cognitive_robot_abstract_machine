@@ -1,41 +1,36 @@
 """
-Fixtures that replace the microphone driver and the models, and the recordings tests
-play through them.
+Fixtures that replace the microphone driver, the models, the ``piper`` program and the
+loudspeaker, the recordings tests play through them, and background listeners.
 """
 
 from __future__ import annotations
 
+import subprocess
+from threading import Thread
+
 import pytest
 import sounddevice
 from cramspeech.microphone import Microphone, Recording
-from cramspeech.speech_recognizer import SpeechDetector, SpeechRecognizer
+from cramspeech.speech_detection import SpeechDetector
+from cramspeech.speech_recognizer import BackgroundListener, SpeechRecognizer
 from cramspeech.transcription import WhisperTranscriber
-from typing_extensions import Callable
+from typing_extensions import Callable, Iterator
 
 from .dataset.non_speech import NonSpeechRecording, NonSpeechSound, SoundSequence
 from .dataset.stand_ins import (
     AudioDevicesOfADesktop,
     DefaultDevicesOfADesktop,
+    LiveInputDevice,
+    LoudspeakerKeepingWhatItPlays,
     ModelHearingSpeechInEverySound,
     ModelReturningSegments,
+    PiperProgram,
     ReplayingInputDevice,
-    SilentInputDevice,
+    SteppedInputDevice,
 )
 
 
 # %% Microphone driver
-@pytest.fixture
-def silent_input_device(monkeypatch: pytest.MonkeyPatch) -> SilentInputDevice:
-    """
-    Replaces the recording calls of :mod:`sounddevice` with silence for the duration of
-    a test.
-    """
-    device = SilentInputDevice()
-    monkeypatch.setattr(sounddevice, "rec", device.rec)
-    monkeypatch.setattr(sounddevice, "wait", device.wait)
-    return device
-
-
 @pytest.fixture
 def replay_through_the_microphone(
     monkeypatch: pytest.MonkeyPatch,
@@ -58,6 +53,48 @@ def replay_through_the_microphone(
 
 
 @pytest.fixture
+def stream_through_the_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[Recording], LiveInputDevice]:
+    """
+    Makes every :class:`sounddevice.InputStream` opened during a test play the given
+    recording and then silence until it is closed.
+    """
+
+    def stream(recording: Recording) -> LiveInputDevice:
+        """
+        :param recording: The audio the microphone delivers before the silence.
+        :return: The device that plays it, for inspecting its streams.
+        """
+        device = LiveInputDevice(recording=recording)
+        monkeypatch.setattr(sounddevice, "InputStream", device.input_stream)
+        return device
+
+    return stream
+
+
+@pytest.fixture
+def step_through_the_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[Recording], SteppedInputDevice]:
+    """
+    Makes every :class:`sounddevice.InputStream` opened during a test play the given
+    recording one block at a time, each when the test delivers it.
+    """
+
+    def step(recording: Recording) -> SteppedInputDevice:
+        """
+        :param recording: The audio the microphone delivers, block by block.
+        :return: The device that plays it, for delivering its blocks.
+        """
+        device = SteppedInputDevice(recording=recording)
+        monkeypatch.setattr(sounddevice, "InputStream", device.input_stream)
+        return device
+
+    return step
+
+
+@pytest.fixture
 def audio_devices_of_a_desktop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> AudioDevicesOfADesktop:
@@ -73,6 +110,29 @@ def audio_devices_of_a_desktop(
         DefaultDevicesOfADesktop(device=(devices.default_input_index, 0)),
     )
     return devices
+
+
+# %% Piper and the loudspeaker
+@pytest.fixture
+def piper_program(monkeypatch: pytest.MonkeyPatch) -> PiperProgram:
+    """
+    Replaces running the ``piper`` program with a stand-in for the duration of a test.
+    """
+    program = PiperProgram()
+    monkeypatch.setattr(subprocess, "run", program.run)
+    return program
+
+
+@pytest.fixture
+def loudspeaker(monkeypatch: pytest.MonkeyPatch) -> LoudspeakerKeepingWhatItPlays:
+    """
+    Replaces the playing calls of :mod:`sounddevice` with a loudspeaker that keeps what
+    it plays, for the duration of a test.
+    """
+    loudspeaker = LoudspeakerKeepingWhatItPlays()
+    monkeypatch.setattr(sounddevice, "play", loudspeaker.play)
+    monkeypatch.setattr(sounddevice, "wait", loudspeaker.wait)
+    return loudspeaker
 
 
 # %% Recordings
@@ -170,3 +230,40 @@ def recognizer_hearing_every_sound(
         transcriber=transcriber_hearing(model_hearing_a_request),
         detector=detector_hearing_every_sound,
     )
+
+
+@pytest.fixture
+def stop_in_time() -> Callable[[BackgroundListener], bool]:
+    """
+    Leaves the ``with`` statement of background listeners from another thread, so that a
+    listener that never stops fails a test instead of hanging it.
+    """
+
+    def stop(listener: BackgroundListener) -> bool:
+        """
+        :param listener: The listening listener to stop.
+        :return: Whether leaving its ``with`` statement finished within five seconds.
+        """
+        stopping = Thread(
+            target=listener.__exit__, args=(None, None, None), daemon=True
+        )
+        stopping.start()
+        stopping.join(timeout=5.0)
+        return not stopping.is_alive()
+
+    return stop
+
+
+@pytest.fixture
+def background_listener(
+    recognizer_hearing_every_sound: SpeechRecognizer,
+    stop_in_time: Callable[[BackgroundListener], bool],
+) -> Iterator[BackgroundListener]:
+    """
+    A listener on :func:`recognizer_hearing_every_sound`, stopped after the test if it
+    still listens, which fails when it does not stop.
+    """
+    listener = BackgroundListener(recognizer=recognizer_hearing_every_sound)
+    yield listener
+    if listener.listening is not None and not stop_in_time(listener):
+        pytest.fail("The background listener did not stop.")

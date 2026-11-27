@@ -9,11 +9,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from cramspeech.inference.plan_model import CompletionKey
+from krrood.patterns.called_positionally import called_positionally
 from typing_extensions import Any
 
 
 # %% Language model
-@dataclass
+@dataclass(kw_only=True)
 class LanguageModelWritingText:
     """
     Takes the place of :class:`llama_cpp.Llama`: writes the same text for every prompt.
@@ -29,6 +30,7 @@ class LanguageModelWritingText:
     The keyword arguments of each :meth:`create_completion` call, in call order.
     """
 
+    @called_positionally
     def create_completion(self, prompt: str, **settings: Any) -> dict[str, Any]:
         """
         :return: :attr:`text` as the one choice of a completion, in the shape llama.cpp

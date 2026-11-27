@@ -26,8 +26,8 @@ def test_instruction_becomes_its_plans() -> None:
     plan_model.language_model = language_model
 
     instruction_plans = plan_model.write_plans(
-        "From the bed, get me a red bell pepper and then how many fasteners do you see "
-        "on the kitchen cabinet."
+        instruction="From the bed, get me a red bell pepper and then how many "
+        "fasteners do you see on the kitchen cabinet."
     )
 
     [settings] = language_model.completion_settings

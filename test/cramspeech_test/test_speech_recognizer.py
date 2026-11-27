@@ -5,34 +5,51 @@ replaying a recording.
 
 from __future__ import annotations
 
+from concurrent.futures import wait
 from itertools import islice
 
 import numpy as np
 import pytest
-from cramspeech.exceptions import NothingHeard
+from cramspeech.exceptions import AlreadyListening, MicrophoneStopped, NothingHeard
 from cramspeech.microphone import Microphone, Recording
-from cramspeech.speech_recognizer import SpeechDetector, SpeechRecognizer
+from cramspeech.speech_detection import SpeechDetector
+from cramspeech.speech_recognizer import BackgroundListener, SpeechRecognizer
 from cramspeech.transcription import Transcript, WhisperTranscriber
 from typing_extensions import Callable
 
 from .dataset.non_speech import NonSpeechRecording, NonSpeechSound, SoundSequence
 from .dataset.stand_ins import (
+    LiveInputDevice,
     ModelHearingSpeechInEverySound,
     ModelReturningSegments,
     ReplayingInputDevice,
-    SilentInputDevice,
 )
+
+
+# %% Defaults
+def test_recognizer_listens_to_the_default_input_with_default_whisper() -> None:
+    """
+    Without arguments a recognizer gets a microphone and a transcriber of its own, with
+    their defaults.
+    """
+    recognizer = SpeechRecognizer()
+
+    assert recognizer.microphone == Microphone()
+    assert recognizer.transcriber == WhisperTranscriber()
+    assert recognizer.transcriber is not SpeechRecognizer().transcriber
 
 
 # %% Hearing for a fixed time
 def test_hear_returns_the_transcribed_text(
-    silent_input_device: SilentInputDevice,
+    one_second_of_silence: Recording,
+    replay_through_the_microphone: Callable[[Recording], ReplayingInputDevice],
     model_hearing_a_request: ModelReturningSegments,
     transcriber_hearing: Callable[[ModelReturningSegments], WhisperTranscriber],
 ) -> None:
     """
     One call records from the microphone and hands the recording to the transcriber.
     """
+    replay_through_the_microphone(one_second_of_silence)
     recognizer = SpeechRecognizer(
         microphone=Microphone(),
         transcriber=transcriber_hearing(model_hearing_a_request),
@@ -61,7 +78,7 @@ def test_hear_next_utterance_returns_the_transcribed_speech(
 
     [(transcribed_audio, _)] = model_hearing_a_request.calls
     expected_utterance = recognizer_hearing_every_sound.detector.search_for_utterance(
-        recording
+        recording=recording
     ).utterance
     assert transcript == Transcript(text=model_hearing_a_request.texts[0])
     assert np.array_equal(transcribed_audio, expected_utterance.waveform)
@@ -155,8 +172,8 @@ def test_hear_utterances_yields_each_utterance_in_order(
     )
     expected_utterances = [
         recording.waveform[
-            sequence.start_of(speech, sample_rate=sample_rate) - lead_in : (
-                sequence.start_of(speech + 1, sample_rate=sample_rate)
+            sequence.start_of(position=speech, sample_rate=sample_rate) - lead_in : (
+                sequence.start_of(position=speech + 1, sample_rate=sample_rate)
             )
         ]
         for speech in (1, 3)
@@ -165,6 +182,34 @@ def test_hear_utterances_yields_each_utterance_in_order(
     assert transcripts == 2 * [Transcript(text=model_hearing_a_request.texts[0])]
     assert all(map(np.array_equal, transcribed_audio, expected_utterances))
     assert len(transcribed_audio) == len(expected_utterances)
+
+
+def test_hear_utterances_skips_utterances_without_words(
+    detector_hearing_every_sound: SpeechDetector,
+    transcriber_hearing: Callable[[ModelReturningSegments], WhisperTranscriber],
+    silence_then_speech_then_pause: SoundSequence,
+    replay_through_the_microphone: Callable[[Recording], ReplayingInputDevice],
+) -> None:
+    """
+    An utterance in which Whisper hears no words, such as a cough, is not yielded.
+    """
+    model_hearing_no_words = ModelReturningSegments(texts=[])
+    recognizer = SpeechRecognizer(
+        microphone=Microphone(),
+        transcriber=transcriber_hearing(model_hearing_no_words),
+        detector=detector_hearing_every_sound,
+    )
+    replay_through_the_microphone(
+        silence_then_speech_then_pause.recording(sample_rate=SpeechDetector.sample_rate)
+    )
+    transcripts = []
+
+    with pytest.raises(MicrophoneStopped):
+        for transcript in recognizer.hear_utterances():
+            transcripts.append(transcript)
+
+    assert len(model_hearing_no_words.calls) == 1
+    assert transcripts == []
 
 
 def test_hear_utterances_releases_the_microphone_when_the_caller_stops(
@@ -211,3 +256,184 @@ def test_listening_through_silence_keeps_only_the_lead_in(
     assert max(model.scored_sample_counts) < lead_in + SpeechDetector.frame_length + (
         block_length
     )
+
+
+# %% Muting while the robot speaks
+def test_speech_heard_while_muted_is_not_transcribed(
+    recognizer_hearing_every_sound: SpeechRecognizer,
+    model_hearing_a_request: ModelReturningSegments,
+    silence_then_speech_then_pause: SoundSequence,
+    replay_through_the_microphone: Callable[[Recording], ReplayingInputDevice],
+) -> None:
+    """
+    What the microphone hears while muted, such as the robot's own voice, never reaches
+    Whisper.
+    """
+    replay_through_the_microphone(
+        silence_then_speech_then_pause.recording(sample_rate=SpeechDetector.sample_rate)
+    )
+
+    microphone = recognizer_hearing_every_sound.microphone
+    with microphone.mute(), pytest.raises(MicrophoneStopped):
+        list(recognizer_hearing_every_sound.hear_utterances())
+
+    assert model_hearing_a_request.calls == []
+
+
+def test_hearing_resumes_after_the_mute(
+    recognizer_hearing_every_sound: SpeechRecognizer,
+    model_hearing_a_request: ModelReturningSegments,
+    silence_then_speech_then_pause: SoundSequence,
+    replay_through_the_microphone: Callable[[Recording], ReplayingInputDevice],
+) -> None:
+    """
+    Speech that arrives once the mute is over is transcribed again.
+    """
+    with recognizer_hearing_every_sound.microphone.mute():
+        pass
+    replay_through_the_microphone(
+        silence_then_speech_then_pause.recording(sample_rate=SpeechDetector.sample_rate)
+    )
+
+    transcript = next(recognizer_hearing_every_sound.hear_utterances())
+
+    assert transcript == Transcript(text=model_hearing_a_request.texts[0])
+
+
+# %% Listening in the background
+def test_background_listener_keeps_what_it_hears(
+    model_hearing_a_request: ModelReturningSegments,
+    silence_then_speech_then_pause: SoundSequence,
+    stream_through_the_microphone: Callable[[Recording], LiveInputDevice],
+    background_listener: BackgroundListener,
+) -> None:
+    """
+    Sentences heard while the caller does something else wait until it takes them.
+    """
+    stream_through_the_microphone(
+        silence_then_speech_then_pause.recording(sample_rate=SpeechDetector.sample_rate)
+    )
+
+    with background_listener:
+        transcript = background_listener.heard.get(timeout=5.0)
+
+    assert transcript == Transcript(text=model_hearing_a_request.texts[0])
+
+
+def test_take_heard_sentences_returns_each_sentence_once(
+    model_hearing_a_request: ModelReturningSegments,
+    silence_then_speech_then_pause: SoundSequence,
+    stream_through_the_microphone: Callable[[Recording], LiveInputDevice],
+    background_listener: BackgroundListener,
+) -> None:
+    """
+    Taking the heard sentences empties them, so a second call returns only what was
+    heard since.
+    """
+    stream_through_the_microphone(
+        silence_then_speech_then_pause.recording(sample_rate=SpeechDetector.sample_rate)
+    )
+    transcript = Transcript(text=model_hearing_a_request.texts[0])
+
+    with background_listener:
+        sentence_heard = background_listener.heard.get(timeout=5.0)
+        background_listener.heard.put(sentence_heard)
+        first_taken = background_listener.take_heard_sentences()
+        second_taken = background_listener.take_heard_sentences()
+
+    assert first_taken == [transcript]
+    assert second_taken == []
+
+
+def test_background_listener_stops_during_silence(
+    stream_through_the_microphone: Callable[[Recording], LiveInputDevice],
+    background_listener: BackgroundListener,
+    stop_in_time: Callable[[BackgroundListener], bool],
+) -> None:
+    """
+    Leaving the ``with`` statement ends the listening while nobody speaks, and releases
+    the microphone.
+    """
+    device = stream_through_the_microphone(
+        NonSpeechRecording(sound=NonSpeechSound.SILENCE, duration=1.0).recording(
+            sample_rate=SpeechDetector.sample_rate
+        )
+    )
+    background_listener.__enter__()
+    listening = background_listener.listening
+
+    assert stop_in_time(background_listener)
+    assert listening.done()
+    assert not device.is_open
+    assert background_listener.heard.empty()
+
+
+def test_background_listener_stops_when_the_caller_raises(
+    stream_through_the_microphone: Callable[[Recording], LiveInputDevice],
+    background_listener: BackgroundListener,
+) -> None:
+    """
+    An error in the ``with`` statement, such as a failed plan, still releases the
+    microphone, and reaches the caller.
+    """
+    device = stream_through_the_microphone(
+        NonSpeechRecording(sound=NonSpeechSound.SILENCE, duration=1.0).recording(
+            sample_rate=SpeechDetector.sample_rate
+        )
+    )
+
+    with pytest.raises(NothingHeard), background_listener:
+        raise NothingHeard(timeout=0.0)
+
+    assert background_listener.listening is None
+    assert not device.is_open
+
+
+def test_background_listener_raises_when_the_microphone_stops(
+    one_second_of_silence: Recording,
+    replay_through_the_microphone: Callable[[Recording], ReplayingInputDevice],
+    background_listener: BackgroundListener,
+) -> None:
+    """
+    A microphone that stops delivering audio, such as an unplugged one, fails the
+    ``with`` statement instead of leaving the caller waiting for sentences.
+    """
+    replay_through_the_microphone(one_second_of_silence)
+
+    with pytest.raises(MicrophoneStopped), background_listener:
+        wait([background_listener.listening], timeout=5.0)
+
+
+def test_take_heard_sentences_raises_when_the_microphone_stopped(
+    one_second_of_silence: Recording,
+    replay_through_the_microphone: Callable[[Recording], ReplayingInputDevice],
+    background_listener: BackgroundListener,
+) -> None:
+    """
+    Once every heard sentence was taken, a stopped microphone is reported while the
+    ``with`` statement still runs.
+    """
+    replay_through_the_microphone(one_second_of_silence)
+
+    with pytest.raises(MicrophoneStopped), background_listener:
+        wait([background_listener.listening], timeout=5.0)
+        with pytest.raises(MicrophoneStopped):
+            background_listener.take_heard_sentences()
+
+
+def test_background_listener_refuses_to_listen_twice(
+    stream_through_the_microphone: Callable[[Recording], LiveInputDevice],
+    background_listener: BackgroundListener,
+) -> None:
+    """
+    Entering a listener that already listens would open a second stream on the same
+    microphone, so it is refused.
+    """
+    stream_through_the_microphone(
+        NonSpeechRecording(sound=NonSpeechSound.SILENCE, duration=1.0).recording(
+            sample_rate=SpeechDetector.sample_rate
+        )
+    )
+
+    with background_listener, pytest.raises(AlreadyListening):
+        background_listener.__enter__()

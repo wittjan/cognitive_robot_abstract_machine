@@ -1,48 +1,194 @@
 # cramspeech
 
-Speech for CRAM. It listens to a microphone, finds where somebody spoke and paused
-with the Silero voice activity model, and transcribes each utterance with
-[faster-whisper](https://github.com/SYSTRAN/faster-whisper). The command `nlp-listen` publishes
-every heard sentence on ROS, and `PlanModel` turns a heard instruction into plans.
+Speech recognition for CRAM. cramspeech listens to a microphone, finds where somebody spoke and
+paused, and transcribes each utterance with [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
+A trained language model then turns a heard instruction into plans.
 
-## Listening on ROS
-
-```bash
-source /opt/ros/jazzy/setup.bash   # rclpy and std_msgs come from the ROS installation
-nlp-listen --list-devices          # the input devices, the default one starred
-nlp-listen --device <name>         # any unique part of a listed name
-nlp-listen --echo                  # the robot also says every heard sentence back
+```
+Microphone ──blocks──▶ SpeechDetector ──utterance──▶ WhisperTranscriber ──▶ Transcript ──▶ PlanModel
+ (sounddevice)          (Silero voice activity)       (faster-whisper)                     (llama.cpp)
+└──────────────────────────── SpeechRecognizer ─────────────────────────────┘
 ```
 
-`nlp-listen` listens from its start until it is stopped with Ctrl+C or SIGTERM. Each utterance
-it heard words in goes out as a `std_msgs/String`:
+`SpeechRecognizer` connects the microphone, the detector and the transcriber. `BackgroundListener`
+runs it in a thread while a plan goes on. Everything is plain Python and needs no ROS.
 
-| Topic | For | Published |
+## Installation
+
+From the repository root:
+
+```bash
+sudo apt install libportaudio2                     # the audio library sounddevice needs
+uv sync --extra speech --active --inexact          # --inexact keeps what is already installed
+```
+
+The Whisper model is downloaded from Hugging Face on the first transcription and cached in
+`~/.cache/huggingface/hub` (`small` is about 480 MB). To fetch it beforehand:
+
+```bash
+python -c "import faster_whisper; faster_whisper.download_model('small')"
+```
+
+## Quick start
+
+```python
+from cramspeech.microphone import InputDevice
+from cramspeech.speech_recognizer import SpeechRecognizer
+
+for device in InputDevice.list_available():        # the default input is starred
+    print(device)
+
+recognizer = SpeechRecognizer()                    # the default input and Whisper settings
+print(recognizer.hear_next_utterance(timeout=10.0).text)
+```
+
+## Three ways to listen
+
+| Call | Returns | Use it for |
 |---|---|---|
-| `whisper_out` | anyone who acts on what was said | always |
-| `/tts_text` | the robot's `tts_node`, which says the sentence back | only with `--echo` |
+| `hear(duration=5.0)` | what was said in the next 5 s | a fixed recording window |
+| `hear_next_utterance(timeout=10.0)` | the first utterance, once its speaker paused | asking one question and waiting for the answer |
+| `hear_utterances(stop_requested=event)` | every utterance with words in it, as it ends | listening continuously |
 
-Options: `--model-size` (`tiny`, `base`, `small`, default `small`), `--compute-type`
-(`int8`, `float16`, `float32`, default `int8`) and `--language` (`en`, `de`, default `en`).
-`nlp-listen --help` lists them.
+```python
+for transcript in recognizer.hear_utterances():    # until you break out of the loop
+    print(transcript.text)
+    if "goodbye" in transcript.text.lower():
+        break                                      # releases the microphone
+```
 
-## From Python
+`hear_next_utterance` waits *timeout* seconds for speech to start, and hears speech that has
+started to its end.
+
+## Listening in a demo
+
+A CRAM demo runs its plan with `run()`, which returns once the robot is done.
+`BackgroundListener` keeps listening meanwhile, in a thread of its own, while its `with`
+statement runs, and keeps every sentence until the demo takes it. In `coraplex/demos/coraplex_hsr_mujoco_demo`, next to `demo.py`:
+
+```python
+from demo import MilkTransportDemonstration
+
+from cramspeech.speech_recognizer import BackgroundListener, SpeechRecognizer
+from cramspeech.transcription import WhisperTranscriber
+
+recognizer = SpeechRecognizer(transcriber=WhisperTranscriber(hotwords=["milk", "table"]))
+print(recognizer.hear_next_utterance(timeout=30.0).text)   # "Bring the milk to the table."
+
+with BackgroundListener(recognizer=recognizer) as listener:   # hears the operator meanwhile
+    MilkTransportDemonstration().run()
+    for transcript in listener.take_heard_sentences():          # also while the plan runs
+        print("Said during the transport:", transcript.text)
+```
+
+Leaving the `with` statement stops listening at the next block, also during silence, and releases
+the microphone, also when the plan fails. When the microphone stops delivering audio, for
+example because it was unplugged, `take_heard_sentences` raises `MicrophoneStopped` once every
+sentence heard before was taken, and leaving the `with` statement raises it too. A listener
+that already listens refuses to be entered again with `AlreadyListening`.
+
+Without the thread, pass a `threading.Event` to `hear_utterances(stop_requested=event)` and set
+it from another thread. Listening ends at the next block, after a transcription under way.
+
+## Not hearing the robot itself
+
+Wrap everything the robot says in `recognizer.microphone.mute()`. Audio recorded meanwhile is
+dropped, together with the block of `block_duration` that was being recorded when the mute
+ended, and with an utterance that was under way when the mute began, also when the recognizer is
+still busy with an earlier utterance. Mutes may overlap, also from several threads; the
+microphone stays muted until the last one ends. A recording of `hear(duration=...)` that
+overlaps a mute is silence:
+
+```python
+with recognizer.microphone.mute():
+    say_on_the_robot("I see a cup and two bottles.")
+    wait_until_spoken()
+```
+
+On the HSR the sentence goes to `/talk_request` as a `tmc_voice_msgs/msg/Voice`. The robot reports
+no end of speaking, so wait inside the mute until the sentence is over.
+
+## Changing the parameters of the pipeline
+
+Every part is a dataclass, so a parameter is a keyword argument where the part is created. A
+part left out gets its defaults, so `SpeechRecognizer(detector=SpeechDetector(pause_duration=0.7))`
+changes only the pause and keeps the default microphone and Whisper settings. Set
+`model_size` and `compute_type` before the first transcription: Whisper is loaded once, then, with
+those two. Every other setting is read each time it is used.
 
 ```python
 from cramspeech.microphone import Microphone
+from cramspeech.speech_detection import SpeechDetector
 from cramspeech.speech_recognizer import SpeechRecognizer
-from cramspeech.transcription import WhisperTranscriber
+from cramspeech.transcription import (
+    WhisperComputeType,
+    WhisperLanguage,
+    WhisperModelSize,
+    WhisperTranscriber,
+)
 
-recognizer = SpeechRecognizer(microphone=Microphone(device=6), transcriber=WhisperTranscriber())
-
-print(recognizer.hear(duration=5.0).text)                # records for 5 s
-print(recognizer.hear_next_utterance(timeout=10.0).text) # waits for one utterance
-for transcript in recognizer.hear_utterances():          # every utterance, until you stop
-    print(transcript.text)
+recognizer = SpeechRecognizer(
+    microphone=Microphone(device="ReSpeaker"),
+    transcriber=WhisperTranscriber(
+        model_size=WhisperModelSize.BASE,          # faster than small, less accurate
+        language=WhisperLanguage.GERMAN,
+        beam_size=5,
+        compute_type=WhisperComputeType.FLOAT16,   # on a graphics card
+        hotwords=["Toya", "dishwasher tab"],
+    ),
+    detector=SpeechDetector(
+        speech_threshold=0.6,                      # a noisy room
+        pause_duration=0.7,                        # answer sooner after the speaker stops
+    ),
+    block_duration=0.25,
+)
 ```
 
-`hear_next_utterance` raises `NothingHeard` when nobody starts speaking within the timeout. All
-listening raises `MicrophoneStopped` when the device stops delivering audio.
+### Microphone
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `device` | `None`, the system's default input | index, or any unique part of the name `InputDevice.list_available()` shows |
+
+### Speech detection (`SpeechDetector`)
+
+| Parameter | Default | Meaning | Change it when |
+|---|---|---|---|
+| `speech_threshold` | `0.5` | Silero score from which a frame counts as speech, 0 to 1 | noise is taken for speech (raise) or quiet speakers are missed (lower) |
+| `pause_duration` | `1.0` s | silence that ends an utterance | replies come too late (lower) or speakers get cut off mid-sentence (raise) |
+| `kept_before_speech` | `0.4` s | audio kept before the first speech, so the first word is not clipped | first words go missing (raise) |
+| `maximum_duration` | `30.0` s | longest utterance, longer speech is cut there | long instructions get cut (raise) |
+
+### Transcription (`WhisperTranscriber`)
+
+| Parameter | Default | Meaning | Change it when |
+|---|---|---|---|
+| `model_size` | `SMALL` | `TINY`, `BASE` or `SMALL` | transcription is too slow (smaller) |
+| `language` | `ENGLISH` | `ENGLISH` or `GERMAN` | the speakers use the other language |
+| `beam_size` | `8` | candidate transcriptions kept while decoding | transcription is too slow (lower, `1` is fastest) |
+| `compute_type` | `INT8` | `INT8` (CPU), `FLOAT16` (graphics card), `FLOAT32` (most accurate, slowest) | Whisper runs on a graphics card |
+| `hotwords` | none | words and phrases the speech is likely to hold | names or objects are heard as similar words |
+
+faster-whisper keeps only the first 223 [tokens](https://github.com/SYSTRAN/faster-whisper/blob/v1.2.1/faster_whisper/transcribe.py)
+of the hotwords (see `get_prompt`), half of Whisper's context of 448 tokens, and drops the rest
+without warning. With its comma an English word takes about 2 tokens and a German compound up to
+6, so about 90 English or 40 German hotwords fit. List the most important ones first, and keep to
+the words the current task expects: hotwords make Whisper prefer a word, they do not guarantee
+it. To count the tokens of a list:
+
+```python
+transcriber = WhisperTranscriber(hotwords=["Toya", "dishwasher tab"])
+hotwords = " " + ", ".join(transcriber.hotwords)
+print(len(transcriber.model.hf_tokenizer.encode(hotwords, add_special_tokens=False).ids))
+```
+
+Whisper runs on a graphics card by itself when faster-whisper finds one, and on the CPU otherwise.
+
+### Listening (`SpeechRecognizer`)
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `block_duration` | `0.25` s | audio between two searches for a finished utterance. It is also how fast a stop takes effect |
 
 ## Plans from an instruction
 
@@ -52,42 +198,69 @@ run by [llama.cpp](https://github.com/ggml-org/llama.cpp):
 ```python
 from pathlib import Path
 
-from cramspeech.inference.plan_model import PlanModel
+from cramspeech.inference.plan_model import ComputeDevice, PlanModel
 
-plan_model = PlanModel(model_path=Path("plan-q4.gguf"))
+plan_model = PlanModel(
+    model_path=Path("plan-q4.gguf"),
+    device=ComputeDevice.GPU,                      # the default, falls back to the CPU
+    maximum_output_token_count=1024,               # longer plans need more
+)
 
 transcript = recognizer.hear_next_utterance(timeout=10.0)
-instruction_plans = plan_model.write_plans(transcript.text)
-for plan in instruction_plans.plans:            # one plan per task of the instruction
-    print(plan.summary, plan.steps)
+instruction_plans = plan_model.write_plans(instruction=transcript.text)
+for plan in instruction_plans.plans:               # one plan per task of the instruction
+    print(plan.summary)
+    for step in plan.steps:
+        print(" ", step.action, step.object_name, step.location, step.person, step.text)
 ```
 
 - The model can only write what [`plan_grammar.gbnf`](src/cramspeech/inference/resources/plan_grammar.gbnf)
   allows: the plan format it was trained on, with any words for objects, locations and people.
 - The model is loaded on the first instruction and then kept.
-
-## Setup
-
-- `cramspeech` is not part of a plain `uv sync`. Install it from the repository root with
-  `uv sync --extra speech --active --inexact`, where `--inexact` keeps what is already installed.
-- `PlanModel` runs on llama-cpp-python, which the CRAM workspace already installs for robokudo.
-- The microphone is read through [sounddevice](https://python-sounddevice.readthedocs.io), which
-  needs the PortAudio library on Linux: `sudo apt install libportaudio2`.
-- `nlp-listen --list-devices` (or `InputDevice.list_available()`) lists the input devices. Pass an
-  index or a unique part of a name as `Microphone(device=...)` or `nlp-listen --device ...`.
-- The Whisper model is downloaded from Hugging Face on the first transcription, not at install
-  time, and cached in `~/.cache/huggingface/hub` (`small` is about 480 MB). To fetch it
-  beforehand: `python -c "import faster_whisper; faster_whisper.download_model('small')"`.
-- `nlp-listen` needs a sourced ROS 2 installation. The Python API works without ROS.
-- As installed, llama-cpp-python runs `PlanModel` on the CPU. On a laptop with an NVIDIA graphics
-  card and the CUDA toolkit, rebuild llama-cpp-python once with CUDA switched on, and the model
-  runs on the graphics card from then on:
+- llama-cpp-python, which the CRAM workspace already installs for robokudo, runs on the CPU as
+  installed. With an NVIDIA graphics card and the CUDA toolkit, rebuild it once with CUDA, and
+  again after every llama-cpp-python update:
 
   ```bash
   CMAKE_ARGS="-DGGML_CUDA=on" uv sync --extra speech --active --inexact \
       --reinstall-package llama-cpp-python --no-cache
   ```
 
-  Run it again whenever llama-cpp-python is updated, since a new version is built for the CPU
-  again. `PlanModel` needs no setting for either: `ComputeDevice.GPU`, the default, uses the
-  graphics card when the build has CUDA and the CPU otherwise.
+## Testing on a laptop
+
+`cramspeech.piper_speaker.Speaker` says sentences on the laptop with a [Piper](https://github.com/OHF-Voice/piper1-gpl)
+voice, the engine the HSR speaks with, so answers and self-hearing can be tried without the
+robot. It is for testing only: on the robot, speak through its speech node.
+
+```bash
+uv tool install piper-tts                          # Piper runs as its own program, `piper`
+uv tool run --from piper-tts python -m piper.download_voices --data-dir voices en_GB-jenny_dioco-medium
+```
+
+```python
+from pathlib import Path
+
+from cramspeech.piper_speaker import Speaker
+
+speaker = Speaker(voice_model=Path("voices/en_GB-jenny_dioco-medium.onnx"))
+with recognizer.microphone.mute():
+    speaker.say(text="Hello, I am Toya.")          # returns once the sentence was played
+```
+
+The tests replace the microphone, the models and Piper with stand-ins, so they need no audio
+hardware or download. From the repository root:
+
+```bash
+CRAM_ORM_BUILD=never python -m pytest test/cramspeech_test --confcutdir=test/cramspeech_test
+```
+
+## Errors
+
+| Exception | Raised when |
+|---|---|
+| `NothingHeard` | nobody starts speaking within the timeout of `hear_next_utterance` |
+| `MicrophoneStopped` | the input device stops delivering audio, for example when it is unplugged |
+| `SampleRateMismatch` | a recording reaches a model at a sample rate the model does not take |
+| `AlreadyListening` | a `BackgroundListener` that already listens is entered again |
+
+All four live in `cramspeech.exceptions`.

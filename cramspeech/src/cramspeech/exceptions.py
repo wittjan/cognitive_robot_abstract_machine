@@ -1,6 +1,7 @@
 """
 Errors of listening and transcribing: audio at the wrong sample rate, nobody speaking in
-time, and a microphone that stopped delivering audio.
+time, a background listener entered twice, and a microphone that stopped delivering
+audio.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from krrood.exceptions import DataclassException
 
 
 # %% Transcription
-@dataclass
+@dataclass(kw_only=True)
 class SampleRateMismatch(DataclassException):
     """
     Raised when a recording reaches a model at a sample rate the model does not take.
@@ -38,7 +39,7 @@ class SampleRateMismatch(DataclassException):
 
 
 # %% Listening
-@dataclass
+@dataclass(kw_only=True)
 class NothingHeard(DataclassException):
     """
     Raised when nobody starts speaking while the microphone is listening.
@@ -59,8 +60,24 @@ class NothingHeard(DataclassException):
         )
 
 
+@dataclass(kw_only=True)
+class AlreadyListening(DataclassException):
+    """
+    Raised when a background listener that already listens is entered again.
+    """
+
+    def error_message(self) -> str:
+        return "The background listener is already listening."
+
+    def suggest_correction(self) -> str:
+        return (
+            "Leave the listener's with statement before entering it again; a second "
+            "listener on the same microphone would hear every sentence twice."
+        )
+
+
 # %% Microphone
-@dataclass
+@dataclass(kw_only=True)
 class MicrophoneStopped(DataclassException):
     """
     Raised when an input device stops delivering audio while it is being listened to.

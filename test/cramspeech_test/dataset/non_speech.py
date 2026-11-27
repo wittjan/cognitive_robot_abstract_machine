@@ -35,7 +35,7 @@ class NonSpeechSound(StrEnum):
 
 
 # %% Recording
-@dataclass(frozen=True)
+@dataclass(kw_only=True, frozen=True)
 class NonSpeechRecording:
     """
     A recording of one :class:`NonSpeechSound`, generated with numpy.
@@ -71,7 +71,7 @@ class NonSpeechRecording:
     Seed of the noise generator, so every run hears the same noise.
     """
 
-    def recording(self, sample_rate: int) -> Recording:
+    def recording(self, *, sample_rate: int) -> Recording:
         """
         :param sample_rate: Samples per second, in hertz.
         :return: :attr:`duration` seconds of :attr:`sound`.
@@ -94,7 +94,7 @@ class NonSpeechRecording:
 
 
 # %% Sequence
-@dataclass
+@dataclass(kw_only=True)
 class SoundSequence:
     """
     Sounds recorded one after another.
@@ -105,19 +105,21 @@ class SoundSequence:
     The sounds, in recording order.
     """
 
-    def recording(self, sample_rate: int) -> Recording:
+    def recording(self, *, sample_rate: int) -> Recording:
         """
         :param sample_rate: Samples per second, in hertz.
         :return: All :attr:`sounds` in one recording.
         """
-        waveforms = [sound.recording(sample_rate).waveform for sound in self.sounds]
+        waveforms = [
+            sound.recording(sample_rate=sample_rate).waveform for sound in self.sounds
+        ]
         return Recording(waveform=np.concatenate(waveforms), sample_rate=sample_rate)
 
-    def start_of(self, position: int, sample_rate: int) -> int:
+    def start_of(self, *, position: int, sample_rate: int) -> int:
         """
         :param position: Index into :attr:`sounds`.
         :param sample_rate: Samples per second, in hertz.
         :return: The sample at which the sound at *position* begins.
         """
         earlier_sounds = SoundSequence(sounds=self.sounds[:position])
-        return len(earlier_sounds.recording(sample_rate).waveform)
+        return len(earlier_sounds.recording(sample_rate=sample_rate).waveform)

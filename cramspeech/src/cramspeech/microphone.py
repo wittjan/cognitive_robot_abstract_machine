@@ -6,18 +6,21 @@ of them.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from contextlib import closing, contextmanager
+from dataclasses import dataclass, field
 from queue import Queue
+from threading import Lock
 
 import numpy as np
 import sounddevice
+from krrood.patterns.classproperty import classproperty
 from typing_extensions import Any, Iterator
 
-from cramspeech.exceptions import MicrophoneStopped
+from cramspeech.exceptions import MicrophoneStopped, SampleRateMismatch
 
 
 # %% Recording
-@dataclass
+@dataclass(kw_only=True)
 class Recording:
     """
     Mono audio as a sequence of samples taken at a fixed rate.
@@ -33,9 +36,28 @@ class Recording:
     Samples per second, in hertz.
     """
 
+    @classproperty
+    def full_scale(cls) -> float:
+        """
+        :return: The largest magnitude a sample can have.
+        """
+        return 1.0
+
+    def require_sample_rate(self, *, model_sample_rate: int) -> None:
+        """
+        :param model_sample_rate: Samples per second, in hertz, the model this recording
+            is handed to takes.
+        :raises SampleRateMismatch: When the recording is at another sample rate.
+        """
+        if self.sample_rate != model_sample_rate:
+            raise SampleRateMismatch(
+                recording_sample_rate=self.sample_rate,
+                model_sample_rate=model_sample_rate,
+            )
+
 
 # %% Input devices
-@dataclass
+@dataclass(kw_only=True)
 class InputDevice:
     """
     An audio device that can record, as sounddevice lists it.
@@ -84,7 +106,7 @@ class InputDevice:
 
 
 # %% Microphone
-@dataclass
+@dataclass(kw_only=True)
 class Microphone:
     """
     An audio input device that records mono audio on request.
@@ -97,30 +119,66 @@ class Microphone:
     ``None`` selects the system's default input.
     """
 
-    def record(self, duration: float, sample_rate: int) -> Recording:
+    mute_lock: Lock = field(default_factory=Lock, init=False, compare=False, repr=False)
+    """
+    Guards the mute counts against mutes that begin and end in several threads at once.
+    """
+
+    begun_mute_count: int = field(default=0, init=False, compare=False)
+    """
+    Number of :meth:`mute` statements begun since the microphone was created.
+    """
+
+    ended_mute_count: int = field(default=0, init=False, compare=False)
+    """
+    Number of :meth:`mute` statements ended since the microphone was created.
+    """
+
+    @contextmanager
+    def mute(self) -> Iterator[None]:
+        """
+        Drop what the device records while the ``with`` statement runs, for example
+        while the robot speaks, including every block recorded partly during it.
+
+        Mutes may overlap, also from several threads: the microphone is muted until the
+        last of them ends.
+        """
+        with self.mute_lock:
+            self.begun_mute_count += 1
+        try:
+            yield
+        finally:
+            with self.mute_lock:
+                self.ended_mute_count += 1
+
+    def record(self, *, duration: float, sample_rate: int) -> Recording:
         """
         Record from the device, returning once the recording is complete.
+
+        A recording that overlaps a :meth:`mute` holds only silence.
 
         :param duration: Length of the recording, in seconds.
         :param sample_rate: Samples per second to record, in hertz.
         :return: The recorded audio.
+        :raises MicrophoneStopped: When the device stops delivering audio.
         """
-        frames = sounddevice.rec(
-            frames=round(duration * sample_rate),
-            samplerate=sample_rate,
-            channels=1,
-            dtype=np.float32,
-            device=self.device,
-        )
-        sounddevice.wait()
-        return Recording(waveform=frames[:, 0], sample_rate=sample_rate)
+        with closing(
+            self.stream(sample_rate=sample_rate, block_duration=duration)
+        ) as blocks:
+            block = next(blocks)
+        if block.size == 0:
+            block = np.zeros(round(duration * sample_rate), dtype=np.float32)
+        return Recording(waveform=block, sample_rate=sample_rate)
 
-    def stream(self, sample_rate: int, block_duration: float) -> Iterator[np.ndarray]:
+    def stream(
+        self, *, sample_rate: int, block_duration: float
+    ) -> Iterator[np.ndarray]:
         """
         Listen to the device until the caller stops iterating, which releases it.
 
         Audio that arrives while the caller is busy is kept until it is read. A block
-        after audio the device lost is logged as a warning.
+        recorded partly or wholly during a :meth:`mute` is empty. Samples beyond
+        :attr:`Recording.full_scale` are clipped to it, and lost audio is logged.
 
         :param sample_rate: Samples per second to record, in hertz.
         :param block_duration: Length of each block, in seconds.
@@ -129,6 +187,7 @@ class Microphone:
         """
         block_length = round(block_duration * sample_rate)
         arrived_blocks: Queue[np.ndarray | None] = Queue()
+        mutes_ended_before_block = self.ended_mute_count
 
         def keep_block(
             samples: np.ndarray,
@@ -137,14 +196,26 @@ class Microphone:
             status: sounddevice.CallbackFlags,
         ) -> None:
             """
-            Queue a copy of the block that just arrived, warning first when audio was
-            lost before it.
+            Queue a clipped copy of the block that just arrived, empty when a mute ran
+            during any part of it, warning first when audio was lost before it.
             """
+            nonlocal mutes_ended_before_block
             if status.input_overflow:
                 logging.getLogger(__name__).warning(
                     f"The input device {self.device!r} lost audio before this block."
                 )
-            arrived_blocks.put(samples[:, 0].copy())
+            # A mute ran during the block if one began that had not ended before the
+            # block started, whether it is still running, ended or began meanwhile.
+            was_muted = self.begun_mute_count > mutes_ended_before_block
+            mutes_ended_before_block = self.ended_mute_count
+            kept_length = 0 if was_muted else frame_count
+            arrived_blocks.put(
+                np.clip(
+                    samples[:kept_length, 0],
+                    -Recording.full_scale,
+                    Recording.full_scale,
+                )
+            )
 
         with sounddevice.InputStream(
             samplerate=sample_rate,

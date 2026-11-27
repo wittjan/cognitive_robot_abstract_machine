@@ -21,3 +21,16 @@ class ModelOutputFile(PathEnumeration):
     The plans the trained model wrote for a training instruction with two tasks:
     bringing an object, and counting objects and telling the count.
     """
+
+
+# %% Piper voices
+class PiperVoiceFile(PathEnumeration):
+    """
+    A Piper voice as the speaker loads it, its model left out since tests never run it.
+    """
+
+    VOICE_MODEL = Path(__file__).parent / "voice.onnx"
+    """
+    The model of a voice that speaks at 22050 Hz, like the HSR's voice, whose
+    configuration lies next to it.
+    """

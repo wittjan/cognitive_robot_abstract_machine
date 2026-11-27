@@ -1060,6 +1060,35 @@ class UnknownPartWholeRelationshipField(UsageError):
         )
 
 
+@dataclass(kw_only=True)
+class NotAPartOf(UsageError):
+    """
+    Raised when
+    :meth:`~semantic_digital_twin.semantic_annotations.mixins.PartWholeRelationship.remove`
+    is called with an annotation that no part-whole relationship field of the whole
+    holds.
+    """
+
+    whole: SemanticAnnotation
+    """
+    The whole the part was being removed from.
+    """
+
+    part: SemanticAnnotation
+    """
+    The annotation that is not a part of the whole.
+    """
+
+    def error_message(self) -> str:
+        return (
+            f"{self.part.name} cannot be removed from {self.whole.name}: "
+            f"it is not one of its parts."
+        )
+
+    def suggest_correction(self) -> str:
+        return f"remove one of the annotations listed by the 'parts' property of {self.whole.name}."
+
+
 @dataclass
 class CollisionDiffersFromVisualError(UsageError):
     """

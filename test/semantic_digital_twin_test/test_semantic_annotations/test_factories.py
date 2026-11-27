@@ -13,6 +13,7 @@ from semantic_digital_twin.datastructures.prefixed_name import PrefixedName
 from semantic_digital_twin.exceptions import (
     CannotBeAPartOf,
     AmbiguousPart,
+    NotAPartOf,
     UnknownPartWholeRelationshipField,
 )
 from semantic_digital_twin.exceptions import (
@@ -47,6 +48,7 @@ from semantic_digital_twin.semantic_annotations.semantic_annotations import (
     Drawer,
     Wall,
     Fridge,
+    Bottle,
     BottleCap,
     DoorWithType,
     Aperture,
@@ -64,7 +66,10 @@ from krrood_spatial_math.spatial_types import (
 )
 from krrood_spatial_math.spatial_types import Vector3
 from semantic_digital_twin.world import World
-from semantic_digital_twin.world_description.connections import FixedConnection
+from semantic_digital_twin.world_description.connections import (
+    Connection6DoF,
+    FixedConnection,
+)
 from semantic_digital_twin.world_description.connections import ScrewAxisConnection
 from semantic_digital_twin.world_description.degree_of_freedom import (
     DegreeOfFreedomLimits,
@@ -1439,6 +1444,156 @@ def test_containment_only_annotation_has_no_add():
     """
     assert not hasattr(Table, "add")
     assert hasattr(Table, "add_object")
+
+
+# %% removing parts
+
+
+def test_remove_hangs_bottle_cap_from_world_root_on_free_joint() -> None:
+    """
+    Removing a cap screwed onto a bottle leaves the bottle open and hangs the cap from
+    the world root on a free joint, where it was.
+    """
+    world = _world_with_root()
+    with world.modify_world():
+        bottle = Bottle.create_with_new_body_in_world(
+            name="bottle",
+            world=world,
+            world_root_T_self=HomogeneousTransformationMatrix.from_xyz_rpy(x=1, y=2),
+            scale=Scale(0.08, 0.08, 0.25),
+        )
+        cap = BottleCap.create_with_new_body_in_world(
+            name="bottle_cap",
+            world=world,
+            world_root_T_self=HomogeneousTransformationMatrix.from_xyz_rpy(
+                x=1, y=2, z=0.135
+            ),
+            scale=Scale(0.03, 0.03, 0.02),
+            parent_connection_specification=ScrewAxisConnectionSpecification(
+                screw_axis=ScrewAxisConnection.create_helical_screw_axis(
+                    axis=Vector3.Z(), pitch=0.005
+                ),
+            ),
+        )
+        bottle.add(cap)
+    world_T_cap = cap.root.global_transform.to_np()
+
+    with world.modify_world():
+        bottle.remove(part=cap)
+
+    assert bottle.bottle_cap is None
+    assert cap.root.parent_kinematic_structure_entity == world.root
+    assert isinstance(cap.root.parent_connection, Connection6DoF)
+    np.testing.assert_allclose(cap.root.global_transform.to_np(), world_T_cap)
+
+
+def test_remove_takes_drawer_out_of_list_field() -> None:
+    """
+    Removing a drawer from a fridge takes it out of the fridge's drawers and hangs it
+    from the world root, while the fridge keeps its door.
+    """
+    world = _world_with_root()
+    with world.modify_world():
+        fridge = Fridge.create_with_new_body_in_world(
+            name="fridge", world=world, scale=Scale(1, 1, 2.0)
+        )
+        drawer = Drawer.create_with_new_body_in_world(name="drawer", world=world)
+        door = Door.create_with_new_body_in_world(
+            name="door", scale=Scale(0.03, 1, 2), world=world
+        )
+        fridge.add(drawer)
+        fridge.add(door)
+
+    with world.modify_world():
+        fridge.remove(part=drawer)
+
+    assert fridge.drawers == []
+    assert fridge.doors == [door]
+
+
+def test_remove_raises_for_annotation_that_is_not_a_part() -> None:
+    """
+    Removing an annotation that is not a part of the whole raises NotAPartOf and leaves
+    the annotation on the connection it hangs from.
+    """
+    world = _world_with_root()
+    with world.modify_world():
+        bottle = Bottle.create_with_new_body_in_world(
+            name="bottle", world=world, scale=Scale(0.08, 0.08, 0.25)
+        )
+        cap = BottleCap.create_with_new_body_in_world(name="bottle_cap", world=world)
+    parent_connection = cap.root.parent_connection
+
+    with world.modify_world():
+        with pytest.raises(NotAPartOf):
+            bottle.remove(part=cap)
+
+    assert cap.root.parent_connection is parent_connection
+
+
+def test_remove_takes_off_the_part_an_equal_annotation_stands_for() -> None:
+    """
+    Removing an annotation equal to the bottle's cap, a cap annotation on the cap's
+    body, leaves the bottle open.
+    """
+    world = _world_with_root()
+    with world.modify_world():
+        bottle = Bottle.create_with_new_body_in_world(
+            name="bottle", world=world, scale=Scale(0.08, 0.08, 0.25)
+        )
+        cap = BottleCap.create_with_new_body_in_world(name="bottle_cap", world=world)
+        bottle.add(cap)
+
+    with world.modify_world():
+        bottle.remove(part=BottleCap(root=cap.root))
+
+    assert bottle.bottle_cap is None
+
+
+def test_remove_remembers_every_removed_part() -> None:
+    """
+    A whole lists every part removed from it, in the order they came off.
+    """
+    world = _world_with_root()
+    with world.modify_world():
+        fridge = Fridge.create_with_new_body_in_world(
+            name="fridge", world=world, scale=Scale(1, 1, 2.0)
+        )
+        first_drawer = Drawer.create_with_new_body_in_world(
+            name="first_drawer", world=world
+        )
+        second_drawer = Drawer.create_with_new_body_in_world(
+            name="second_drawer", world=world
+        )
+        fridge.add(first_drawer)
+        fridge.add(second_drawer)
+
+    with world.modify_world():
+        fridge.remove(part=first_drawer)
+        fridge.remove(part=second_drawer)
+
+    assert fridge.removed_parts == [first_drawer, second_drawer]
+
+
+def test_add_takes_part_back_out_of_removed_parts() -> None:
+    """
+    Putting a removed cap back onto its bottle takes it out of the bottle's removed
+    parts.
+    """
+    world = _world_with_root()
+    with world.modify_world():
+        bottle = Bottle.create_with_new_body_in_world(
+            name="bottle", world=world, scale=Scale(0.08, 0.08, 0.25)
+        )
+        cap = BottleCap.create_with_new_body_in_world(name="bottle_cap", world=world)
+        bottle.add(cap)
+    with world.modify_world():
+        bottle.remove(part=cap)
+
+    with world.modify_world():
+        bottle.add(cap)
+
+    assert bottle.removed_parts == []
 
 
 # %% movable joints
